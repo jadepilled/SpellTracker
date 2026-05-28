@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="description" content="SpellTracker is a fast League of Legends enemy summoner spell cooldown tracker for desktop, iOS, Android, and GitHub Pages hosting.">
+    <meta name="author" content="psyopgirl">
+    <meta name="robots" content="index,follow">
+    <link rel="canonical" href="https://spelltracker.gg/">
+    <meta name="theme-color" content="#121212">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="SpellTracker">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta property="og:site_name" content="SpellTracker">
+    <meta property="og:title" content="SpellTracker - League of Legends Summoner Spell Tracker">
+    <meta property="og:description" content="Track enemy League of Legends summoner spell cooldowns with accurate haste modifiers and responsive mobile-first layouts.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://spelltracker.gg/">
+    <meta property="og:image" content="https://spelltracker.gg/assets/favicon.png">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="SpellTracker - League of Legends Summoner Spell Tracker">
+    <meta name="twitter:description" content="A fast, static League of Legends enemy summoner spell cooldown tracker.">
+    <meta name="twitter:image" content="https://spelltracker.gg/assets/favicon.png">
+    <title>SpellTracker - League of Legends Summoner Spell Tracker</title>
+    <link rel="preload" href="./assets/font/UnDotum-latin.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="manifest" href="./site.webmanifest">
+    <link rel="icon" href="./assets/favicon.png" type="image/png" sizes="300x300">
+    <link rel="shortcut icon" href="./assets/favicon.png" type="image/png">
+    <link rel="apple-touch-icon" href="./assets/favicon.png">
+    <link rel="stylesheet" href="./src/styles.css">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "SpellTracker",
+        "url": "https://spelltracker.gg/",
+        "applicationCategory": "GameApplication",
+        "operatingSystem": "Any",
+        "author": {
+          "@type": "Person",
+          "name": "psyopgirl"
+        },
+        "description": "League of Legends enemy summoner spell cooldown tracker."
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <div class="loading-screen">
+        <div class="loading-mark"><img src="./assets/favicon.png" alt=""></div>
+        <div>Loading Riot data</div>
+      </div>
+    </div>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
