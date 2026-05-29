@@ -1,8 +1,7 @@
 const DATA_URL = "./data/lol.json";
-const STATE_SCHEMA = 8;
+const ADS_URL = "./data/ads.json";
+const STATE_SCHEMA = 10;
 const STORE_KEY = "spelltracker:v7";
-const AD_STORE_KEY = "spelltracker:ads:v1";
-const AD_DISMISS_MS = 2 * 60 * 1000;
 const EMPTY_CHAMPION_IMAGE = "./assets/champion/None.png";
 const BRAND_ICON = "./assets/favicon.png";
 const ROLE_ICONS = {
@@ -33,16 +32,43 @@ const MODES = {
 };
 
 const ADJUSTMENTS = [-1, -5, -30, 1, 5, 30];
+const TIMELINE_PAST_MS = 30 * 1000;
+const TIMELINE_FUTURE_MS = 5 * 60 * 1000;
+const MODE_BASE_SUMMONER_SPELL_HASTE = {
+  aram: 70
+};
+const SPELL_COLORS = {
+  SummonerBarrier: "#e7c84f",
+  SummonerBoost: "#64c9d8",
+  SummonerExhaust: "#8c6be8",
+  SummonerFlash: "#d4d53f",
+  SummonerHaste: "#8fcf55",
+  SummonerHeal: "#60c56a",
+  SummonerDot: "#e35a2e",
+  SummonerSmite: "#d65b34",
+  SummonerTeleport: "#8768d8",
+  SummonerMana: "#4e9be8",
+  SummonerCherryFlash: "#d4d53f",
+  SummonerCherryHold: "#8fcf55",
+  SummonerSnowURFSnowball_Mark: "#75c8e8",
+  SummonerSnowball: "#75c8e8",
+  SummonerPoroThrow: "#c28d54",
+  SummonerPoroRecall: "#d5ba76"
+};
 
 let appData = null;
+let adConfig = { ads: [] };
 let state = null;
 const ui = {
   championPickerIndex: null,
   championQuery: "",
   championActiveIndex: 0,
   spellContext: null,
-  dismissedAdUntil: loadAdDismissals(),
-  adRefreshTimer: null
+  gameTimerMenuOpen: false,
+  dismissedAds: new Set(),
+  adSlots: {},
+  lastTimelineRenderAt: 0,
+  timelineRefreshBlockedUntil: 0
 };
 
 const app = document.querySelector("#app");
@@ -51,12 +77,18 @@ init();
 
 async function init() {
   try {
-    appData = await fetchJson(DATA_URL);
+    const [lolData, ads] = await Promise.all([
+      fetchJson(DATA_URL),
+      fetchJson(ADS_URL).catch(() => ({ ads: [] }))
+    ]);
+    appData = lolData;
+    adConfig = ads;
     state = hydrateState(loadState());
     app.addEventListener("click", handleClick);
     app.addEventListener("change", handleChange);
     app.addEventListener("input", handleInput);
     window.addEventListener("keydown", handleKeydown);
+    window.addEventListener("resize", () => requestAnimationFrame(updateTimelineCurrentLine));
     render();
     updateTimers();
     setInterval(updateTimers, 250);
@@ -85,8 +117,13 @@ function makeDefaultState(mode = "classic") {
     mode,
     theme: "dark",
     flashKey: "D",
+    viewMode: "scoreboard",
+    headerCollapsed: defaultHeaderCollapsed(),
     paused: false,
     pausedAt: null,
+    gameTimeMs: 0,
+    gameStartedAt: null,
+    gameTimerRunning: false,
     players: LANES.map((lane, laneIndex) => ({
       role: mode === "aram" ? "mid" : lane.id,
       championId: "",
@@ -105,13 +142,19 @@ function makeDefaultState(mode = "classic") {
 
 function hydrateState(saved) {
   const fallback = makeDefaultState();
-  if (!saved || ![5, 6, 7, STATE_SCHEMA].includes(saved.schema) || !Array.isArray(saved.players)) {
+  if (!saved || ![5, 6, 7, 8, STATE_SCHEMA].includes(saved.schema) || !Array.isArray(saved.players)) {
     return fallback;
   }
 
   const mode = saved.mode === "aram" ? "aram" : "classic";
   const theme = saved.theme === "light" ? "light" : "dark";
   const flashKey = saved.flashKey === "F" ? "F" : "D";
+  const viewMode = saved.viewMode === "timeline" ? "timeline" : "scoreboard";
+  const paused = Boolean(saved.paused);
+  const gameTimerRunning = Boolean(saved.gameTimerRunning);
+  const gameStartedAt = gameTimerRunning && !paused && Number.isFinite(Number(saved.gameStartedAt))
+    ? Number(saved.gameStartedAt)
+    : null;
   const spellIds = new Set(appData.spells.map((spell) => spell.id));
   const championIds = new Set(appData.champions.map((champion) => champion.id));
   const validModifierIds = new Set(selectableModifiers().map((modifier) => modifier.id));
@@ -123,8 +166,13 @@ function hydrateState(saved) {
     mode,
     theme,
     flashKey,
-    paused: Boolean(saved.paused),
+    viewMode,
+    headerCollapsed: typeof saved.headerCollapsed === "boolean" ? saved.headerCollapsed : fallback.headerCollapsed,
+    paused,
     pausedAt: Number(saved.pausedAt) || null,
+    gameTimeMs: Math.max(0, Number(saved.gameTimeMs) || 0),
+    gameStartedAt,
+    gameTimerRunning,
     players: fallback.players.map((player, playerIndex) => {
       const savedPlayer = saved.players[playerIndex] || {};
       const savedSlots = Array.isArray(savedPlayer.slots) ? savedPlayer.slots : [];
@@ -151,7 +199,7 @@ function hydrateState(saved) {
           return {
             spellId: savedSpell,
             cooldowns: Array.isArray(savedSlot.cooldowns)
-              ? savedSlot.cooldowns.map(Number).filter(Number.isFinite)
+              ? savedSlot.cooldowns.map(normalizeCooldownEntry).filter(Boolean)
               : []
           };
         })
@@ -171,50 +219,14 @@ function loadState() {
   }
 }
 
-function loadAdDismissals() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(AD_STORE_KEY));
-    return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveAdDismissals() {
-  localStorage.setItem(AD_STORE_KEY, JSON.stringify(ui.dismissedAdUntil));
-}
-
 function isAdDismissed(adId) {
-  const until = Number(ui.dismissedAdUntil[adId]) || 0;
-  if (until > Date.now()) {
-    return true;
-  }
-  if (until) {
-    delete ui.dismissedAdUntil[adId];
-    saveAdDismissals();
-  }
-  return false;
+  return ui.dismissedAds.has(adId);
 }
 
-function dismissAd(adId, banner) {
+function dismissAd(adId) {
   if (!adId) return;
-  ui.dismissedAdUntil[adId] = Date.now() + AD_DISMISS_MS;
-  saveAdDismissals();
-  banner?.classList.add("is-dismissed");
-  scheduleAdRefresh();
-  window.setTimeout(render, 180);
-}
-
-function scheduleAdRefresh() {
-  window.clearTimeout(ui.adRefreshTimer);
-  const now = Date.now();
-  const nextUntil = Object.values(ui.dismissedAdUntil)
-    .map(Number)
-    .filter((until) => until > now)
-    .sort((a, b) => a - b)[0];
-  if (nextUntil) {
-    ui.adRefreshTimer = window.setTimeout(render, Math.max(250, nextUntil - now + 50));
-  }
+  ui.dismissedAds.add(adId);
+  render();
 }
 
 function saveState() {
@@ -224,15 +236,45 @@ function saveState() {
 function render() {
   pruneAllCooldowns();
   applyTheme();
+  const topAd = renderAdBanner("top");
+  const bottomAd = renderAdBanner("bottom");
   app.innerHTML = `
-    <div class="tracker-shell">
-      ${renderAdBanner("top")}
-      <header class="topbar">
+    <div class="tracker-shell ${state.headerCollapsed ? "is-header-collapsed" : ""} ${topAd ? "has-top-ad" : ""}" data-view="${state.viewMode}">
+      ${renderTopbar()}
+      ${renderGameTimer()}
+      ${topAd}
+      ${renderPrimaryView()}
+      <div class="bottom-rail">
+        ${bottomAd}
+        <footer class="site-disclaimer">
+          SpellTracker and spelltracker.lol copyright &copy; SpellTracker 2026. League of Legends, all champions, icons, names, and images are copyright &copy; Riot Games. SpellTracker is not endorsed by, affiliated with, partnered with, or approved by Riot Games.
+        </footer>
+      </div>
+    </div>
+    ${renderChampionModal()}
+    ${renderSpellContext()}
+  `;
+
+  focusChampionSearch();
+  requestAnimationFrame(updateTimelineCurrentLine);
+}
+
+function renderTopbar() {
+  return `
+    <header class="topbar">
+      <button class="control-button drawer-button" type="button" data-action="toggle-header" aria-expanded="${!state.headerCollapsed}">
+        ${state.headerCollapsed ? "Menu" : "Hide"}
+      </button>
+      <div class="drawer-summary" aria-hidden="${!state.headerCollapsed}">
+        <span>SpellTracker</span>
+        <small>Patch ${escapeHtml(appData.version)}</small>
+      </div>
+      <div class="topbar-content">
         <div class="brand">
           <div class="brand-mark"><img src="${BRAND_ICON}" alt=""></div>
           <div>
             <h1>SpellTracker</h1>
-            <p>Patch ${escapeHtml(appData.version)} · by psyopgirl</p>
+            <p>Patch ${escapeHtml(appData.version)} &middot; by psyopgirl</p>
           </div>
         </div>
         <div class="topbar-actions">
@@ -240,6 +282,9 @@ function render() {
             ${state.paused ? "Resume" : "Pause"}
           </button>
           <button class="control-button reset-button" type="button" data-action="reset-site">Reset</button>
+          <button class="control-button view-button ${state.viewMode === "timeline" ? "is-on" : ""}" type="button" data-action="toggle-view">
+            ${state.viewMode === "timeline" ? "Timeline" : "Scoreboard"}
+          </button>
           <button class="control-button flash-button" type="button" data-action="toggle-flash-key">
             Flash on ${escapeHtml(state.flashKey)}
           </button>
@@ -251,22 +296,180 @@ function render() {
           </button>
           <a class="control-button donate-button" href="https://ko-fi.com/psyopgirl" target="_blank" rel="noopener noreferrer">Donate</a>
         </div>
-      </header>
-
-      <main class="team-board" data-mode="${state.mode}">
-        ${state.players.map(renderPlayer).join("")}
-      </main>
-      <footer class="site-disclaimer">
-        &copy; SpellTracker 2026. League of Legends &copy; Riot Games. SpellTracker is not endorsed by, affiliated with, partnered with, or approved by Riot Games.
-      </footer>
-      ${renderAdBanner("bottom")}
-    </div>
-    ${renderChampionModal()}
-    ${renderSpellContext()}
+      </div>
+    </header>
   `;
+}
 
-  focusChampionSearch();
-  scheduleAdRefresh();
+function renderGameTimer() {
+  const running = isGameTimerAdvancing();
+  return `
+    <section class="game-timer" aria-label="Game timer">
+      <div class="game-time-readout">
+        <span data-game-time>${formatGameTime(currentGameTimeMs())}</span>
+        <small data-game-timer-state>${running ? "Live" : "Paused"}</small>
+      </div>
+      <div class="game-timer-actions">
+        <button class="control-button game-start-button ${running ? "is-on" : ""}" type="button" data-action="toggle-game-timer" aria-label="${running ? "Pause game timer" : "Start game timer"}">
+          ${running ? "&#9208;" : "&#9654;"}
+        </button>
+        <button class="control-button game-reset-button" type="button" data-action="reset-game-timer" aria-label="Reset game timer">&#8634;</button>
+        <button class="control-button game-clock-button ${ui.gameTimerMenuOpen ? "is-on" : ""}" type="button" data-action="toggle-game-time-menu" aria-label="Adjust game timer" aria-expanded="${ui.gameTimerMenuOpen}">&#9201;</button>
+      </div>
+      ${ui.gameTimerMenuOpen ? renderGameTimeMenu() : ""}
+    </section>
+  `;
+}
+
+function renderGameTimeMenu() {
+  return `
+    <div class="game-time-popover" role="menu" aria-label="Adjust game time">
+      ${ADJUSTMENTS.map((amount) => `
+        <button type="button" data-action="adjust-game-time" data-delta="${amount}" aria-label="${amount > 0 ? "Add" : "Subtract"} ${Math.abs(amount)} seconds game time">
+          ${amount > 0 ? "+" : ""}${amount}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderPrimaryView() {
+  if (state.viewMode === "timeline") {
+    return renderTimelineView();
+  }
+
+  return `
+    <main class="team-board" data-mode="${state.mode}">
+      ${state.players.map(renderPlayer).join("")}
+    </main>
+  `;
+}
+
+function renderTimelineView() {
+  return `
+    <main class="timeline-view" data-timeline-view>
+      ${timelineInnerHtml()}
+    </main>
+  `;
+}
+
+function timelineInnerHtml() {
+  const { gameNow, windowStart, windowEnd, nowLeft } = timelineWindow();
+
+  return `
+    <section class="upcoming-strip" aria-label="Upcoming cooldowns">
+      ${renderUpcomingCooldowns()}
+    </section>
+    <section class="timeline-board" style="--now-left:${nowLeft}%;" aria-label="Summoner spell timeline">
+      <span class="timeline-board-current" data-timeline-current aria-hidden="true"></span>
+      <div class="timeline-scale" aria-hidden="true">
+        <span>${formatGameTime(windowStart)}</span>
+        <span>${formatGameTime(gameNow)}</span>
+        <span>${formatGameTime(windowEnd)}</span>
+      </div>
+      ${state.players.map((player, playerIndex) => renderTimelineRow(player, playerIndex, windowStart, windowEnd)).join("")}
+    </section>
+  `;
+}
+
+function renderUpcomingCooldowns() {
+  const upcoming = collectUpcomingCooldowns().slice(0, 10);
+  if (!upcoming.length) {
+    return `<span class="upcoming-empty">No active enemy summoner spell cooldowns.</span>`;
+  }
+
+  return upcoming.map((entry) => `
+    <span class="upcoming-chip" aria-label="${escapeHtml(`${entry.championName} ${entry.spell.name} ${formatGameTime(entry.endGameMs)}`)}">
+      <img class="upcoming-owner" src="${entry.ownerImage}" alt="">
+      <img class="upcoming-spell" src="${entry.spell.image}" alt="">
+      <b>${formatGameTime(entry.endGameMs)}</b>
+    </span>
+  `).join("");
+}
+
+function renderTimelineRow(player, playerIndex, windowStart, windowEnd) {
+  const champion = championById(player.championId);
+  const championImage = champion?.image || EMPTY_CHAMPION_IMAGE;
+  const championName = champion ? champion.name : "No champion";
+  const displayRole = displayRoleForPlayer(playerIndex);
+  const roleIcon = ROLE_ICONS[displayRole.id];
+  const haste = getTotalHaste(player);
+  const nowLeft = percentBetween(currentGameTimeMs(), windowStart, windowEnd);
+
+  return `
+    <article class="timeline-row" data-player="${playerIndex}">
+      <div class="timeline-loadout">
+        <button class="timeline-champion" type="button" data-action="open-champion-picker" data-player="${playerIndex}" aria-label="${displayRole.label} champion">
+          <img src="${championImage}" alt="${champion ? escapeHtml(champion.name) : "No champion selected"}">
+          ${roleIcon ? `<span><img class="role-icon" src="${roleIcon}" alt=""></span>` : ""}
+        </button>
+        <div class="timeline-identity">
+          <strong>${escapeHtml(championName)}</strong>
+          <span>${renderHasteValue(haste)}</span>
+        </div>
+        <div class="timeline-spells">
+          ${player.slots.map((slot, slotIndex) => renderTimelineSpell(player, playerIndex, slot, slotIndex)).join("")}
+        </div>
+      </div>
+      <div class="timeline-tracks">
+        <span class="timeline-row-current" style="left:${nowLeft}%;" aria-hidden="true"></span>
+        ${player.slots.map((slot, slotIndex) => renderTimelineTrack(player, playerIndex, slot, slotIndex, windowStart, windowEnd)).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderTimelineSpell(player, playerIndex, slot, slotIndex) {
+  const spell = spellById(slot.spellId) || spellPool()[0];
+  const status = getSlotStatus(player, slot);
+  const fallback = spell.name.slice(0, 2).toUpperCase();
+  const contextOpen = ui.spellContext?.playerIndex === playerIndex && ui.spellContext?.slotIndex === slotIndex;
+
+  return `
+    <section class="timeline-spell ${status.isCooling ? "is-cooling" : ""}" data-player="${playerIndex}" data-slot="${slotIndex}" style="--cooldown-fill:${status.progressPercent}%">
+      <button class="spell-button" type="button" data-action="fire-spell" data-player="${playerIndex}" data-slot="${slotIndex}" aria-label="${escapeHtml(spell.name)}">
+        <span class="spell-art">
+          ${spell.image ? `<img src="${spell.image}" alt="">` : `<span>${escapeHtml(fallback)}</span>`}
+        </span>
+        <span class="spell-timer" data-spell-timer>${escapeHtml(status.timerText)}</span>
+      </button>
+      <button class="context-toggle ${contextOpen ? "is-open" : ""}" type="button" data-action="toggle-spell-context" data-player="${playerIndex}" data-slot="${slotIndex}" aria-label="Open ${escapeHtml(spell.name)} menu">...</button>
+    </section>
+  `;
+}
+
+function renderTimelineTrack(player, playerIndex, slot, slotIndex, windowStart, windowEnd) {
+  const spell = spellById(slot.spellId) || spellPool()[0];
+  const now = referenceNow();
+  const gameNow = currentGameTimeMs();
+  const nowLeft = percentBetween(gameNow, windowStart, windowEnd);
+  const color = spellColor(spell);
+  const textColor = readableTextColor(color);
+  const active = activeCooldowns(slot, now);
+  const blocks = active.map((cooldown, cooldownIndex) => {
+    const durationMs = cooldownDurationMs(cooldown, spell, player);
+    const endGameMs = cooldownGameEndMs(cooldown, now, gameNow);
+    const startGameMs = cooldownGameStartMs(cooldown, endGameMs, durationMs);
+    const left = percentBetween(Math.max(startGameMs, windowStart), windowStart, windowEnd);
+    const right = percentBetween(Math.min(endGameMs, windowEnd), windowStart, windowEnd);
+    const width = clamp(right - left, 1.5, 100);
+    const readyAt = formatGameTime(endGameMs);
+    const remainingText = formatSeconds((cooldownEndAt(cooldown) - now) / 1000, "ceil");
+    const tooltip = timelineBlockTooltip(spell, remainingText, readyAt);
+    return `
+      <span class="timeline-block timeline-block-${slotIndex}" data-player="${playerIndex}" data-slot="${slotIndex}" data-cooldown-index="${cooldownIndex}" data-tooltip="${escapeHtml(tooltip)}" aria-label="${escapeHtml(tooltip)}" style="left:${left}%; width:${width}%; --spell-color:${color}; --spell-text:${textColor};">
+        <b>${escapeHtml(spell.name)}</b>
+        <em>${escapeHtml(remainingText)}</em>
+      </span>
+    `;
+  }).join("");
+
+  return `
+    <div class="timeline-track" data-player="${playerIndex}" data-slot="${slotIndex}" aria-label="${escapeHtml(spell.name)} timeline">
+      <span class="timeline-track-current" style="left:${nowLeft}%;" aria-hidden="true"></span>
+      ${blocks || `<span class="timeline-ready">Ready</span>`}
+    </div>
+  `;
 }
 
 function renderPlayer(player, playerIndex) {
@@ -357,15 +560,22 @@ function renderTimeControls(playerIndex, slot, slotIndex) {
 }
 
 function renderAdBanner(position) {
+  if (position === "top" && isSkinnyLayout()) {
+    return "";
+  }
   if (isAdDismissed(position)) {
+    return "";
+  }
+  const ad = adForPosition(position);
+  if (!ad) {
     return "";
   }
 
   return `
     <aside class="ad-banner ad-banner-${position}" data-ad-id="${position}" aria-label="Advertisement">
-      <div class="ad-creative">
-        <span>Your ad here? - Possibly! Email admin@spelltracker.lol</span>
-      </div>
+      <a class="ad-creative" href="${escapeHtml(ad.href || "mailto:admin@spelltracker.lol")}" target="_blank" rel="noopener noreferrer" aria-label="${escapeHtml(ad.label || "Advertise with SpellTracker")}">
+        <img src="${escapeHtml(ad.src)}" alt="${escapeHtml(ad.label || "Advertisement")}">
+      </a>
       <button class="ad-close" type="button" data-action="dismiss-ad" data-ad-id="${position}" aria-label="Close advertisement">X</button>
     </aside>
   `;
@@ -373,7 +583,7 @@ function renderAdBanner(position) {
 
 function renderModifierButton({ modifier, selected, playerIndex }) {
   return `
-    <button class="modifier-button ${selected ? "is-selected" : ""}" type="button" data-action="toggle-modifier" data-player="${playerIndex}" data-modifier-id="${modifier.id}" aria-pressed="${selected}" title="${escapeHtml(modifier.name)}">
+    <button class="modifier-button ${selected ? "is-selected" : ""}" type="button" data-action="toggle-modifier" data-player="${playerIndex}" data-modifier-id="${modifier.id}" aria-pressed="${selected}">
       ${modifier.image ? `<img class="modifier-icon" src="${modifier.image}" alt="">` : ""}
       <span class="modifier-name">${escapeHtml(modifier.name)}</span>
       <span class="modifier-haste">${renderHasteValue(modifier.haste)}</span>
@@ -445,10 +655,35 @@ function renderSpellContext() {
           <button type="button" class="icon-button" data-action="close-spell-context" aria-label="Close">X</button>
         </div>
 
-        <div class="context-section">
+        <div class="context-section context-spells">
+          <div class="context-label">Spell</div>
           <div class="spell-option-grid">
             ${spellPool().map((option) => renderSpellOption(option, spell.id, context)).join("")}
           </div>
+        </div>
+        <div class="context-tools">
+          <section class="context-section">
+            <div class="context-label">Timing</div>
+            <div class="context-timer-buttons">
+              ${ADJUSTMENTS.map((amount) => `
+                <button type="button" data-action="adjust-cooldown" data-player="${context.playerIndex}" data-slot="${context.slotIndex}" data-delta="${amount}" aria-label="${amount > 0 ? "Add" : "Subtract"} ${Math.abs(amount)} seconds ${escapeHtml(spell.name)}">
+                  ${amount > 0 ? "+" : ""}${amount}
+                </button>
+              `).join("")}
+              <button class="context-reset-button" type="button" data-action="clear-slot" data-player="${context.playerIndex}" data-slot="${context.slotIndex}" aria-label="Reset ${escapeHtml(spell.name)} cooldown">
+                Reset CD
+              </button>
+            </div>
+          </section>
+          <section class="context-section">
+            <div class="context-label">Modifiers</div>
+            <div class="context-modifier-grid">
+              <div class="haste-total" aria-label="${getTotalHaste(player)} summoner spell haste">
+                ${renderHasteValue(getTotalHaste(player))}
+              </div>
+              ${renderModifierButtons(player, context.playerIndex)}
+            </div>
+          </section>
         </div>
       </section>
     </div>
@@ -458,7 +693,7 @@ function renderSpellContext() {
 function renderSpellOption(spell, selectedSpellId, context) {
   const fallback = spell.name.slice(0, 2).toUpperCase();
   return `
-    <button class="spell-option ${spell.id === selectedSpellId ? "is-selected" : ""}" type="button" data-action="replace-spell" data-player="${context.playerIndex}" data-slot="${context.slotIndex}" data-spell-id="${spell.id}" aria-label="${escapeHtml(spell.name)}" title="${escapeHtml(spell.name)}">
+    <button class="spell-option ${spell.id === selectedSpellId ? "is-selected" : ""}" type="button" data-action="replace-spell" data-player="${context.playerIndex}" data-slot="${context.slotIndex}" data-spell-id="${spell.id}" aria-label="${escapeHtml(spell.name)}">
       <span class="spell-option-art">${spell.image ? `<img src="${spell.image}" alt="">` : `<span>${escapeHtml(fallback)}</span>`}</span>
     </button>
   `;
@@ -553,9 +788,8 @@ function handleClick(event) {
 
   const action = actionTarget.dataset.action;
   if (action === "dismiss-ad") {
-    const banner = actionTarget.closest(".ad-banner");
     const adId = actionTarget.dataset.adId;
-    dismissAd(adId, banner);
+    dismissAd(adId);
     return;
   }
 
@@ -568,6 +802,40 @@ function handleClick(event) {
 
   if (action === "toggle-pause") {
     togglePause();
+    return;
+  }
+
+  if (action === "toggle-header") {
+    state.headerCollapsed = !state.headerCollapsed;
+    saveAndRender();
+    return;
+  }
+
+  if (action === "toggle-view") {
+    state.viewMode = state.viewMode === "timeline" ? "scoreboard" : "timeline";
+    ui.spellContext = null;
+    saveAndRender();
+    return;
+  }
+
+  if (action === "toggle-game-timer") {
+    toggleGameTimer();
+    return;
+  }
+
+  if (action === "toggle-game-time-menu") {
+    ui.gameTimerMenuOpen = !ui.gameTimerMenuOpen;
+    render();
+    return;
+  }
+
+  if (action === "reset-game-timer") {
+    resetGameTimer();
+    return;
+  }
+
+  if (action === "adjust-game-time") {
+    adjustGameTime(Number(actionTarget.dataset.delta));
     return;
   }
 
@@ -640,6 +908,7 @@ function handleClick(event) {
 
   if (action === "fire-spell") {
     fireSpell(Number(actionTarget.dataset.player), Number(actionTarget.dataset.slot));
+    ui.timelineRefreshBlockedUntil = Date.now() + 900;
     saveAndRender();
     return;
   }
@@ -782,17 +1051,88 @@ function applyTheme() {
   document.querySelector("meta[name='theme-color']")?.setAttribute("content", themeColor);
 }
 
+function toggleGameTimer() {
+  if (isGameTimerAdvancing()) {
+    state.gameTimeMs = currentGameTimeMs();
+    state.gameStartedAt = null;
+    state.gameTimerRunning = false;
+  } else {
+    if (state.paused) {
+      resumeTrackingClock();
+    }
+    state.gameTimerRunning = true;
+    state.gameStartedAt = Date.now();
+  }
+  saveAndRender();
+}
+
+function resetGameTimer() {
+  ui.gameTimerMenuOpen = false;
+  const deltaMs = -currentGameTimeMs();
+  shiftAllCooldownGameTimes(deltaMs);
+  state.gameTimeMs = 0;
+  state.gameStartedAt = state.gameTimerRunning && !state.paused ? Date.now() : null;
+  saveAndRender();
+}
+
+function adjustGameTime(seconds) {
+  ui.gameTimerMenuOpen = false;
+  const currentTime = currentGameTimeMs();
+  const nextTime = Math.max(0, currentTime + seconds * 1000);
+  shiftAllCooldownGameTimes(nextTime - currentTime);
+  state.gameTimeMs = nextTime;
+  state.gameStartedAt = state.gameTimerRunning && !state.paused ? Date.now() : null;
+  saveAndRender();
+}
+
+function isGameTimerAdvancing() {
+  return Boolean(state?.gameTimerRunning && !state.paused && state.gameStartedAt);
+}
+
+function currentGameTimeMs() {
+  if (!state) return 0;
+  if (isGameTimerAdvancing()) {
+    return Math.max(0, (Number(state.gameTimeMs) || 0) + Date.now() - Number(state.gameStartedAt));
+  }
+  return Math.max(0, Number(state.gameTimeMs) || 0);
+}
+
+function updateGameTimerDisplay() {
+  const timer = app.querySelector("[data-game-time]");
+  const stateText = app.querySelector("[data-game-timer-state]");
+  if (timer) timer.textContent = formatGameTime(currentGameTimeMs());
+  if (stateText) stateText.textContent = isGameTimerAdvancing() ? "Live" : "Paused";
+}
+
+function resumeTrackingClock() {
+  const delta = Date.now() - (state.pausedAt || Date.now());
+  for (const player of state.players) {
+    for (const slot of player.slots) {
+      slot.cooldowns = slot.cooldowns.map((cooldown) => shiftCooldown(cooldown, delta));
+    }
+  }
+  state.paused = false;
+  state.pausedAt = null;
+}
+
+function shiftAllCooldownGameTimes(deltaMs) {
+  if (!deltaMs) return;
+  for (const player of state.players) {
+    for (const slot of player.slots) {
+      slot.cooldowns = slot.cooldowns.map((cooldown) => shiftCooldownGameTime(cooldown, deltaMs));
+    }
+  }
+}
+
 function togglePause() {
   if (state.paused) {
-    const delta = Date.now() - (state.pausedAt || Date.now());
-    for (const player of state.players) {
-      for (const slot of player.slots) {
-        slot.cooldowns = slot.cooldowns.map((endAt) => endAt + delta);
-      }
+    resumeTrackingClock();
+    if (state.gameTimerRunning) {
+      state.gameStartedAt = Date.now();
     }
-    state.paused = false;
-    state.pausedAt = null;
   } else {
+    state.gameTimeMs = currentGameTimeMs();
+    state.gameStartedAt = null;
     state.paused = true;
     state.pausedAt = Date.now();
   }
@@ -807,20 +1147,21 @@ function fireSpell(playerIndex, slotIndex) {
 
   const maxAmmo = Math.max(1, spell.maxAmmo);
   const now = referenceNow();
-  const active = slot.cooldowns.filter((endAt) => endAt > now).sort((a, b) => a - b);
+  const active = activeCooldowns(slot, now);
   const durationMs = effectiveCooldown(spell, player) * 1000;
+  const nextCooldown = createCooldown(now, durationMs);
 
   if (maxAmmo === 1 && active.length > 0) {
-    slot.cooldowns = [now + durationMs];
+    slot.cooldowns = [nextCooldown];
     return;
   }
 
   if (active.length < maxAmmo) {
-    active.push(now + durationMs);
+    active.push(nextCooldown);
   } else {
-    active[0] = now + durationMs;
+    active[0] = nextCooldown;
   }
-  slot.cooldowns = active.sort((a, b) => a - b);
+  slot.cooldowns = sortCooldowns(active);
 }
 
 function startFullCooldown(playerIndex, slotIndex) {
@@ -832,17 +1173,17 @@ function adjustCooldown(playerIndex, slotIndex, seconds) {
   const player = state.players[playerIndex];
   const slot = player.slots[slotIndex];
   const now = referenceNow();
-  const active = slot.cooldowns.filter((endAt) => endAt > now).sort((a, b) => a - b);
+  const active = activeCooldowns(slot, now);
 
   if (active.length === 0) {
     if (seconds > 0) {
-      slot.cooldowns = [now + seconds * 1000];
+      slot.cooldowns = [createCooldown(now, seconds * 1000)];
     }
     return;
   }
 
-  active[0] = Math.max(now, active[0] + seconds * 1000);
-  slot.cooldowns = active.filter((endAt) => endAt > now).sort((a, b) => a - b);
+  active[0] = adjustCooldownEntry(active[0], seconds * 1000, now);
+  slot.cooldowns = sortCooldowns(active.filter((cooldown) => cooldownEndAt(cooldown) > now));
 }
 
 function clearSlot(playerIndex, slotIndex) {
@@ -866,9 +1207,159 @@ function clearAllCooldowns() {
   }
 }
 
+function normalizeCooldownEntry(entry) {
+  if ((typeof entry === "number" || typeof entry === "string") && Number.isFinite(Number(entry))) {
+    return {
+      startAt: null,
+      endAt: Number(entry),
+      startGameMs: null,
+      endGameMs: null,
+      durationMs: null
+    };
+  }
+
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+
+  const endAt = Number(entry.endAt);
+  if (!Number.isFinite(endAt)) {
+    return null;
+  }
+
+  return {
+    startAt: Number.isFinite(Number(entry.startAt)) ? Number(entry.startAt) : null,
+    endAt,
+    startGameMs: Number.isFinite(Number(entry.startGameMs)) ? Number(entry.startGameMs) : null,
+    endGameMs: Number.isFinite(Number(entry.endGameMs)) ? Number(entry.endGameMs) : null,
+    durationMs: Number.isFinite(Number(entry.durationMs)) ? Math.max(0, Number(entry.durationMs)) : null
+  };
+}
+
+function createCooldown(now, durationMs) {
+  const safeDuration = Math.max(0, Number(durationMs) || 0);
+  const gameNow = currentGameTimeMs();
+  return {
+    startAt: now,
+    endAt: now + safeDuration,
+    startGameMs: gameNow,
+    endGameMs: gameNow + safeDuration,
+    durationMs: safeDuration
+  };
+}
+
+function shiftCooldown(cooldown, deltaMs) {
+  const entry = normalizeCooldownEntry(cooldown);
+  if (!entry) return cooldown;
+  return {
+    ...entry,
+    startAt: Number.isFinite(Number(entry.startAt)) ? entry.startAt + deltaMs : entry.startAt,
+    endAt: entry.endAt + deltaMs
+  };
+}
+
+function shiftCooldownGameTime(cooldown, deltaMs) {
+  const entry = normalizeCooldownEntry(cooldown);
+  if (!entry) return cooldown;
+  return {
+    ...entry,
+    startGameMs: Number.isFinite(Number(entry.startGameMs)) ? Math.max(0, entry.startGameMs + deltaMs) : entry.startGameMs,
+    endGameMs: Number.isFinite(Number(entry.endGameMs)) ? Math.max(0, entry.endGameMs + deltaMs) : entry.endGameMs
+  };
+}
+
+function adjustCooldownEntry(cooldown, deltaMs, now) {
+  const entry = normalizeCooldownEntry(cooldown);
+  if (!entry) return cooldown;
+  const nextEndAt = Math.max(now, entry.endAt + deltaMs);
+  const nextEndGameMs = Number.isFinite(Number(entry.endGameMs))
+    ? Math.max(currentGameTimeMs(), entry.endGameMs + deltaMs)
+    : currentGameTimeMs() + Math.max(0, nextEndAt - now);
+  const startAt = Number.isFinite(Number(entry.startAt)) ? entry.startAt : now;
+  const startGameMs = Number.isFinite(Number(entry.startGameMs)) ? entry.startGameMs : currentGameTimeMs();
+
+  return {
+    ...entry,
+    startAt,
+    endAt: nextEndAt,
+    startGameMs,
+    endGameMs: nextEndGameMs,
+    durationMs: Math.max(0, nextEndAt - startAt)
+  };
+}
+
+function cooldownEndAt(cooldown) {
+  return Number(normalizeCooldownEntry(cooldown)?.endAt) || 0;
+}
+
+function cooldownDurationMs(cooldown, spell, player) {
+  const entry = normalizeCooldownEntry(cooldown);
+  if (Number.isFinite(Number(entry?.durationMs)) && entry.durationMs > 0) {
+    return entry.durationMs;
+  }
+  const endAt = cooldownEndAt(cooldown);
+  const startAt = Number(entry?.startAt);
+  if (Number.isFinite(startAt) && endAt > startAt) {
+    return endAt - startAt;
+  }
+  return Math.max(1, effectiveCooldown(spell, player) * 1000);
+}
+
+function cooldownGameEndMs(cooldown, now = referenceNow(), gameNow = currentGameTimeMs()) {
+  const entry = normalizeCooldownEntry(cooldown);
+  if (Number.isFinite(Number(entry?.endGameMs))) {
+    return Math.max(0, entry.endGameMs);
+  }
+  return Math.max(0, gameNow + Math.max(0, cooldownEndAt(cooldown) - now));
+}
+
+function cooldownGameStartMs(cooldown, endGameMs, durationMs) {
+  const entry = normalizeCooldownEntry(cooldown);
+  if (Number.isFinite(Number(entry?.startGameMs))) {
+    return Math.max(0, entry.startGameMs);
+  }
+  return Math.max(0, endGameMs - Math.max(0, durationMs));
+}
+
+function activeCooldowns(slot, now = referenceNow()) {
+  return sortCooldowns((slot?.cooldowns || [])
+    .map(normalizeCooldownEntry)
+    .filter((cooldown) => cooldown && cooldown.endAt > now));
+}
+
+function sortCooldowns(cooldowns) {
+  return cooldowns.sort((a, b) => cooldownEndAt(a) - cooldownEndAt(b));
+}
+
+function collectUpcomingCooldowns() {
+  const now = referenceNow();
+  const gameNow = currentGameTimeMs();
+  const entries = [];
+  for (const [playerIndex, player] of state.players.entries()) {
+    const champion = championById(player.championId);
+    for (const [slotIndex, slot] of player.slots.entries()) {
+      const spell = spellById(slot.spellId);
+      const cooldown = activeCooldowns(slot, now)[0];
+      if (!spell || !cooldown) continue;
+      const displayRole = displayRoleForPlayer(playerIndex);
+      entries.push({
+        playerIndex,
+        slotIndex,
+        spell,
+        championName: champion?.name || displayRole.label,
+        ownerImage: champion?.image || ROLE_ICONS[displayRole.id] || EMPTY_CHAMPION_IMAGE,
+        endGameMs: cooldownGameEndMs(cooldown, now, gameNow),
+        remainingMs: cooldownEndAt(cooldown) - now
+      });
+    }
+  }
+  return entries.sort((a, b) => a.remainingMs - b.remainingMs);
+}
+
 function updateTimers() {
   if (!state || !appData) return;
-  const panels = app.querySelectorAll(".spell-panel[data-player][data-slot]");
+  updateGameTimerDisplay();
+  const panels = app.querySelectorAll(".spell-panel[data-player][data-slot], .timeline-spell[data-player][data-slot]");
   for (const panel of panels) {
     const player = state.players[Number(panel.dataset.player)];
     const slot = player.slots[Number(panel.dataset.slot)];
@@ -883,15 +1374,137 @@ function updateTimers() {
     if (timer) timer.textContent = status.timerText;
     if (charges) charges.textContent = status.chargeText;
   }
+
+  const timeline = app.querySelector("[data-timeline-view]");
+  if (timeline) {
+    updateTimelineLiveContent(timeline);
+  }
+}
+
+function timelineWindow() {
+  const gameNow = currentGameTimeMs();
+  const windowStart = Math.max(0, gameNow - TIMELINE_PAST_MS);
+  const windowEnd = Math.max(windowStart + 60 * 1000, gameNow + TIMELINE_FUTURE_MS);
+  const nowLeft = percentBetween(gameNow, windowStart, windowEnd);
+  return { gameNow, windowStart, windowEnd, nowLeft };
+}
+
+function updateTimelineLiveContent(timeline) {
+  const { gameNow, windowStart, windowEnd, nowLeft } = timelineWindow();
+  const scale = timeline.querySelector(".timeline-scale");
+  if (scale) {
+    const labels = scale.querySelectorAll("span");
+    if (labels[0]) labels[0].textContent = formatGameTime(windowStart);
+    if (labels[1]) labels[1].textContent = formatGameTime(gameNow);
+    if (labels[2]) labels[2].textContent = formatGameTime(windowEnd);
+  }
+
+  for (const marker of timeline.querySelectorAll(".timeline-row-current, .timeline-track-current")) {
+    marker.style.left = `${nowLeft}%`;
+  }
+  updateTimelineCurrentLine();
+
+  const needsRender = updateTimelineTracksInPlace(timeline, windowStart, windowEnd);
+  const nowMs = Date.now();
+  if (needsRender && nowMs > ui.timelineRefreshBlockedUntil && !isTimelinePointerActive(timeline)) {
+    ui.lastTimelineRenderAt = nowMs;
+    timeline.innerHTML = timelineInnerHtml();
+    requestAnimationFrame(updateTimelineCurrentLine);
+    return;
+  }
+
+  const strip = timeline.querySelector(".upcoming-strip");
+  if (strip && nowMs - ui.lastTimelineRenderAt > 1000 && !strip.matches(":hover")) {
+    ui.lastTimelineRenderAt = nowMs;
+    strip.innerHTML = renderUpcomingCooldowns();
+  }
+}
+
+function updateTimelineTracksInPlace(timeline, windowStart, windowEnd) {
+  const now = referenceNow();
+  const gameNow = currentGameTimeMs();
+  let needsRender = false;
+
+  for (const track of timeline.querySelectorAll(".timeline-track[data-player][data-slot]")) {
+    const playerIndex = Number(track.dataset.player);
+    const slotIndex = Number(track.dataset.slot);
+    const player = state.players[playerIndex];
+    const slot = player?.slots[slotIndex];
+    const spell = spellById(slot?.spellId);
+    if (!player || !slot || !spell) {
+      needsRender = true;
+      continue;
+    }
+
+    const active = activeCooldowns(slot, now);
+    const blocks = track.querySelectorAll(".timeline-block");
+    const ready = track.querySelector(".timeline-ready");
+    if (active.length !== blocks.length || (active.length === 0) !== Boolean(ready)) {
+      needsRender = true;
+      continue;
+    }
+
+    active.forEach((cooldown, cooldownIndex) => {
+      const block = blocks[cooldownIndex];
+      if (!block) {
+        needsRender = true;
+        return;
+      }
+      const durationMs = cooldownDurationMs(cooldown, spell, player);
+      const endGameMs = cooldownGameEndMs(cooldown, now, gameNow);
+      const startGameMs = cooldownGameStartMs(cooldown, endGameMs, durationMs);
+      const left = percentBetween(Math.max(startGameMs, windowStart), windowStart, windowEnd);
+      const right = percentBetween(Math.min(endGameMs, windowEnd), windowStart, windowEnd);
+      const width = clamp(right - left, 1.5, 100);
+      const readyAt = formatGameTime(endGameMs);
+      const remainingText = formatSeconds((cooldownEndAt(cooldown) - now) / 1000, "ceil");
+      const tooltip = timelineBlockTooltip(spell, remainingText, readyAt);
+
+      block.style.left = `${left}%`;
+      block.style.width = `${width}%`;
+      block.dataset.tooltip = tooltip;
+      block.setAttribute("aria-label", tooltip);
+      const remaining = block.querySelector("em");
+      if (remaining) remaining.textContent = remainingText;
+    });
+  }
+
+  return needsRender;
+}
+
+function isTimelinePointerActive(timeline) {
+  return Boolean(timeline.querySelector(".timeline-block:hover, .timeline-block:focus-visible, .timeline-spell:hover, .timeline-spell:focus-within, .spell-context:hover"));
+}
+
+function updateTimelineCurrentLine() {
+  const board = app.querySelector(".timeline-board");
+  const line = board?.querySelector("[data-timeline-current]");
+  const firstTracks = board?.querySelector(".timeline-tracks");
+  const allTracks = board ? [...board.querySelectorAll(".timeline-tracks")] : [];
+  const lastTracks = allTracks[allTracks.length - 1];
+  if (!board || !line || !firstTracks || !lastTracks) return;
+
+  const { nowLeft } = timelineWindow();
+  const boardRect = board.getBoundingClientRect();
+  const firstRect = firstTracks.getBoundingClientRect();
+  const lastRect = lastTracks.getBoundingClientRect();
+  const x = firstRect.left - boardRect.left + (firstRect.width * nowLeft) / 100;
+  board.style.setProperty("--timeline-current-x", `${x}px`);
+  board.style.setProperty("--timeline-current-top", `${Math.max(0, firstRect.top - boardRect.top)}px`);
+  board.style.setProperty("--timeline-current-bottom", `${Math.max(0, boardRect.bottom - lastRect.bottom)}px`);
+}
+
+function timelineBlockTooltip(spell, remainingText, readyAt) {
+  return `${spell.name}: ${remainingText} left. Ready at ${readyAt}`;
 }
 
 function getSlotStatus(player, slot) {
   const spell = spellById(slot.spellId);
   const now = referenceNow();
-  const active = slot.cooldowns.filter((endAt) => endAt > now).sort((a, b) => a - b);
+  const active = activeCooldowns(slot, now);
   const maxAmmo = Math.max(1, spell?.maxAmmo || 1);
   const available = Math.max(0, maxAmmo - active.length);
-  const nextEnd = active[0] || 0;
+  const nextEnd = active[0] ? cooldownEndAt(active[0]) : 0;
   const remainingMs = Math.max(0, nextEnd - now);
   const fullMs = Math.max(1, effectiveCooldown(spell, player) * 1000);
   const progressPercent = clamp((remainingMs / fullMs) * 100, 0, 100);
@@ -909,7 +1522,9 @@ function pruneAllCooldowns() {
   const now = referenceNow();
   for (const player of state.players) {
     for (const slot of player.slots) {
-      slot.cooldowns = slot.cooldowns.filter((endAt) => endAt > now).sort((a, b) => a - b);
+      slot.cooldowns = sortCooldowns(slot.cooldowns
+        .map(normalizeCooldownEntry)
+        .filter((cooldown) => cooldown && cooldownEndAt(cooldown) > now));
     }
   }
 }
@@ -928,9 +1543,11 @@ function effectiveCooldown(spell, player) {
 }
 
 function getTotalHaste(player) {
-  return Math.round(selectedModifierIds(player)
+  const modeHaste = MODE_BASE_SUMMONER_SPELL_HASTE[state?.mode] || 0;
+  const selectedHaste = selectedModifierIds(player)
     .map((modifierId) => modifierById(modifierId)?.haste || 0)
-    .reduce((total, haste) => total + haste, 0));
+    .reduce((total, haste) => total + haste, 0);
+  return Math.round(modeHaste + selectedHaste);
 }
 
 function selectedModifierIds(player) {
@@ -984,6 +1601,48 @@ function selectableModifiers() {
   return [...legacyRunes, ...legacyItems];
 }
 
+function activeAds() {
+  const now = Date.now();
+  return (Array.isArray(adConfig?.ads) ? adConfig.ads : [])
+    .filter((ad) => ad && ad.enabled !== false && ad.src)
+    .filter((ad) => {
+      const startsAt = ad.startsAt ? Date.parse(ad.startsAt) : null;
+      const endsAt = ad.endsAt ? Date.parse(ad.endsAt) : null;
+      return (!Number.isFinite(startsAt) || startsAt <= now)
+        && (!Number.isFinite(endsAt) || endsAt >= now);
+    });
+}
+
+function adForPosition(position) {
+  if (ui.adSlots[position]) {
+    return ui.adSlots[position];
+  }
+
+  const used = new Set(Object.values(ui.adSlots).filter(Boolean).map((ad) => ad.id));
+  const candidates = activeAds().filter((ad) => !used.has(ad.id));
+  if (!candidates.length) {
+    return null;
+  }
+
+  const index = Math.floor(Math.random() * candidates.length);
+  ui.adSlots[position] = candidates[index];
+  return ui.adSlots[position];
+}
+
+function spellColor(spell) {
+  return SPELL_COLORS[spell?.id] || "#dcdcdc";
+}
+
+function readableTextColor(hexColor) {
+  const hex = String(hexColor || "").replace("#", "");
+  if (hex.length !== 6) return "#111111";
+  const red = parseInt(hex.slice(0, 2), 16);
+  const green = parseInt(hex.slice(2, 4), 16);
+  const blue = parseInt(hex.slice(4, 6), 16);
+  const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+  return luminance > 0.58 ? "#111111" : "#ffffff";
+}
+
 function getModeDefaults(mode, playerIndex) {
   return MODES[mode]?.defaultSpells[playerIndex] || MODES.classic.defaultSpells[playerIndex];
 }
@@ -1024,6 +1683,26 @@ function championById(id) {
 
 function referenceNow() {
   return state?.paused ? state.pausedAt || Date.now() : Date.now();
+}
+
+function defaultHeaderCollapsed() {
+  return isSkinnyLayout();
+}
+
+function isSkinnyLayout() {
+  return typeof window !== "undefined"
+    && window.matchMedia?.("(max-width: 760px), (max-width: 1020px) and (min-height: 640px), (max-aspect-ratio: 0.8), (max-height: 520px) and (orientation: landscape)")?.matches;
+}
+
+function percentBetween(value, start, end) {
+  return clamp(((value - start) / Math.max(1, end - start)) * 100, 0, 100);
+}
+
+function formatGameTime(valueMs) {
+  const totalSeconds = Math.max(0, Math.floor((Number(valueMs) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function formatSeconds(value, mode = "round") {

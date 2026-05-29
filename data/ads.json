@@ -1,0 +1,52 @@
+{
+  "ads": [
+    {
+      "id": "ad-banner-1",
+      "enabled": true,
+      "src": "./assets/ad/ad-banner-1.webp",
+      "href": "mailto:admin@spelltracker.lol",
+      "startsAt": null,
+      "endsAt": null
+    },
+    {
+      "id": "ad-banner-2",
+      "enabled": true,
+      "src": "./assets/ad/ad-banner-2.webp",
+      "href": "mailto:admin@spelltracker.lol",
+      "startsAt": null,
+      "endsAt": null
+    },
+    {
+      "id": "ad-banner-3",
+      "enabled": true,
+      "src": "./assets/ad/ad-banner-3.webp",
+      "href": "mailto:admin@spelltracker.lol",
+      "startsAt": null,
+      "endsAt": null
+    },
+    {
+      "id": "ad-banner-4",
+      "enabled": true,
+      "src": "./assets/ad/ad-banner-4.webp",
+      "href": "mailto:admin@spelltracker.lol",
+      "startsAt": null,
+      "endsAt": null
+    },
+    {
+      "id": "ad-banner-5",
+      "enabled": true,
+      "src": "./assets/ad/ad-banner-5.webp",
+      "href": "mailto:admin@spelltracker.lol",
+      "startsAt": null,
+      "endsAt": null
+    },
+    {
+      "id": "ad-banner-6",
+      "enabled": true,
+      "src": "./assets/ad/ad-banner-6.webp",
+      "href": "mailto:admin@spelltracker.lol",
+      "startsAt": null,
+      "endsAt": null
+    }
+  ]
+}
