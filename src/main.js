@@ -1,7 +1,14 @@
 const DATA_URL = "./data/lol.json";
 const ADS_URL = "./data/ads.json";
-const STATE_SCHEMA = 10;
+const STATE_SCHEMA = 11;
 const STORE_KEY = "spelltracker:v7";
+const COUNTER_API_URL = window.SPELLTRACKER_COUNTER_ENDPOINT
+  || "https://spelltracker-counter.jade-431.workers.dev/api/cooldowns";
+const ANALYTICS_API_URL = window.SPELLTRACKER_ANALYTICS_ENDPOINT
+  || "https://spelltracker-counter.jade-431.workers.dev/api/analytics";
+const COUNTER_REFRESH_MS = 5 * 60 * 1000;
+const COUNTER_SYNC_DEBOUNCE_MS = 2200;
+const COUNTER_BATCH_LIMIT = 100;
 const EMPTY_CHAMPION_IMAGE = "./assets/champion/None.png";
 const BRAND_ICON = "./assets/favicon.png";
 const ROLE_ICONS = {
@@ -20,9 +27,17 @@ const LANES = [
   { id: "support", label: "SUP", defaultSpells: ["SummonerFlash", "SummonerHeal"] }
 ];
 
+const ROLE_PLACEHOLDER_LABELS = {
+  top: "Top Laner",
+  jungle: "Jungler",
+  mid: "Mid Laner",
+  bot: "Bot Laner",
+  support: "Support"
+};
+
 const MODES = {
   classic: {
-    label: "Classic",
+    label: "SR",
     defaultSpells: LANES.map((lane) => lane.defaultSpells)
   },
   aram: {
@@ -32,8 +47,12 @@ const MODES = {
 };
 
 const ADJUSTMENTS = [-1, -5, -30, 1, 5, 30];
+const GAME_TIME_MENU_FADE_MS = 160;
+const STOP_PROMPT_MS = 1800;
 const TIMELINE_PAST_MS = 30 * 1000;
 const TIMELINE_FUTURE_MS = 5 * 60 * 1000;
+const MAX_GAME_TIME_MS = 1000 * 60 * 1000;
+const FLASH_ICON = "./assets/spell/SummonerFlash.png";
 const MODE_BASE_SUMMONER_SPELL_HASTE = {
   aram: 70
 };
@@ -65,6 +84,19 @@ const ui = {
   championActiveIndex: 0,
   spellContext: null,
   gameTimerMenuOpen: false,
+  gameTimerMenuClosing: false,
+  gameTimerMenuCloseTimer: null,
+  stopPromptVisible: false,
+  stopPromptTimer: null,
+  stopShakeTimer: null,
+  resetConfirmVisible: false,
+  interactionDenied: false,
+  viewTransition: false,
+  counterSyncing: false,
+  counterSyncTimer: null,
+  counterRefreshTimer: null,
+  counterAnimating: false,
+  counterAnimationTimer: null,
   dismissedAds: new Set(),
   adSlots: {},
   lastTimelineRenderAt: 0,
@@ -87,10 +119,16 @@ async function init() {
     app.addEventListener("click", handleClick);
     app.addEventListener("change", handleChange);
     app.addEventListener("input", handleInput);
+    app.addEventListener("wheel", handleWheel, { passive: false });
+    document.addEventListener("contextmenu", preventDefaultSiteMenu);
+    document.addEventListener("dragstart", preventDefaultSiteMenu);
+    document.addEventListener("selectstart", preventSiteSelection);
     window.addEventListener("keydown", handleKeydown);
     window.addEventListener("resize", () => requestAnimationFrame(updateTimelineCurrentLine));
     render();
     updateTimers();
+    initCooldownCounter();
+    trackSiteView();
     setInterval(updateTimers, 250);
   } catch (error) {
     app.innerHTML = `
@@ -124,6 +162,9 @@ function makeDefaultState(mode = "classic") {
     gameTimeMs: 0,
     gameStartedAt: null,
     gameTimerRunning: false,
+    counterTotal: 0,
+    counterPending: 0,
+    counterLastFetchAt: 0,
     players: LANES.map((lane, laneIndex) => ({
       role: mode === "aram" ? "mid" : lane.id,
       championId: "",
@@ -142,7 +183,7 @@ function makeDefaultState(mode = "classic") {
 
 function hydrateState(saved) {
   const fallback = makeDefaultState();
-  if (!saved || ![5, 6, 7, 8, STATE_SCHEMA].includes(saved.schema) || !Array.isArray(saved.players)) {
+  if (!saved || ![5, 6, 7, 8, 10, STATE_SCHEMA].includes(saved.schema) || !Array.isArray(saved.players)) {
     return fallback;
   }
 
@@ -173,6 +214,9 @@ function hydrateState(saved) {
     gameTimeMs: Math.max(0, Number(saved.gameTimeMs) || 0),
     gameStartedAt,
     gameTimerRunning,
+    counterTotal: Math.max(0, Number(saved.counterTotal) || 0),
+    counterPending: Math.max(0, Number(saved.counterPending) || 0),
+    counterLastFetchAt: Math.max(0, Number(saved.counterLastFetchAt) || 0),
     players: fallback.players.map((player, playerIndex) => {
       const savedPlayer = saved.players[playerIndex] || {};
       const savedSlots = Array.isArray(savedPlayer.slots) ? savedPlayer.slots : [];
@@ -233,13 +277,178 @@ function saveState() {
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
 }
 
+function saveCooldownChange() {
+  saveState();
+  if (state.viewMode === "timeline") {
+    render();
+    return;
+  }
+  pruneAllCooldowns();
+  updateTimers();
+}
+
+function initCooldownCounter() {
+  renderCounterValue();
+  refreshCooldownCounter();
+  scheduleCounterSync(900);
+  clearInterval(ui.counterRefreshTimer);
+  ui.counterRefreshTimer = setInterval(refreshCooldownCounter, COUNTER_REFRESH_MS);
+}
+
+function counterDisplayTotal() {
+  return Math.max(0, Number(state?.counterTotal) || 0) + Math.max(0, Number(state?.counterPending) || 0);
+}
+
+function renderCounterValue({ animate = false } = {}) {
+  if (animate) {
+    ui.counterAnimating = true;
+  }
+  const counter = app.querySelector(".cooldown-counter");
+  const value = app.querySelector("[data-counter-value]");
+  if (!counter || !value || !state) return;
+  value.textContent = formatCounterNumber(counterDisplayTotal());
+  if (!animate) return;
+
+  counter.classList.remove("is-updating");
+  void counter.offsetWidth;
+  counter.classList.add("is-updating");
+  clearTimeout(ui.counterAnimationTimer);
+  ui.counterAnimationTimer = setTimeout(() => {
+    counter.classList.remove("is-updating");
+    ui.counterAnimating = false;
+  }, 520);
+}
+
+function queueCounterAnimation() {
+  ui.counterAnimating = true;
+  requestAnimationFrame(() => renderCounterValue({ animate: true }));
+}
+
+function addPendingCooldownCompletions(amount) {
+  const safeAmount = Math.max(0, Math.floor(Number(amount) || 0));
+  if (!safeAmount || !state) return;
+  state.counterPending = Math.max(0, Number(state.counterPending) || 0) + safeAmount;
+  saveState();
+  renderCounterValue({ animate: true });
+  scheduleCounterSync();
+}
+
+function scheduleCounterSync(delay = COUNTER_SYNC_DEBOUNCE_MS) {
+  clearTimeout(ui.counterSyncTimer);
+  if (!state || Number(state.counterPending) <= 0) return;
+  ui.counterSyncTimer = setTimeout(flushCooldownCounter, delay);
+}
+
+async function refreshCooldownCounter({ force = false } = {}) {
+  if (!state || !COUNTER_API_URL) return;
+  const now = Date.now();
+  if (!force && now - Number(state.counterLastFetchAt || 0) < COUNTER_REFRESH_MS) return;
+
+  try {
+    const response = await fetch(COUNTER_API_URL, {
+      method: "GET",
+      headers: { "Accept": "application/json" },
+      cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`Counter refresh failed: ${response.status}`);
+    const data = await response.json();
+    applyCounterTotal(data.total, now);
+  } catch {
+    state.counterLastFetchAt = now;
+    saveState();
+  }
+}
+
+async function flushCooldownCounter() {
+  if (!state || ui.counterSyncing || Number(state.counterPending) <= 0 || !COUNTER_API_URL) return;
+  ui.counterSyncing = true;
+  const amount = Math.min(COUNTER_BATCH_LIMIT, Math.max(1, Math.floor(Number(state.counterPending) || 0)));
+  const previousDisplay = counterDisplayTotal();
+
+  try {
+    const response = await fetch(COUNTER_API_URL, {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ amount }),
+      cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`Counter sync failed: ${response.status}`);
+    const data = await response.json();
+    state.counterPending = Math.max(0, Number(state.counterPending || 0) - amount);
+    state.counterTotal = Math.max(Number(state.counterTotal) || 0, Math.max(0, Math.floor(Number(data.total) || 0)));
+    state.counterLastFetchAt = Date.now();
+    saveState();
+    renderCounterValue({ animate: counterDisplayTotal() !== previousDisplay });
+  } catch {
+    scheduleCounterSync(30 * 1000);
+  } finally {
+    ui.counterSyncing = false;
+  }
+
+  if (Number(state.counterPending) > 0) {
+    scheduleCounterSync(900);
+  }
+}
+
+function applyCounterTotal(total, fetchedAt = Date.now(), { save = true } = {}) {
+  if (!state) return;
+  const nextTotal = Math.max(0, Math.floor(Number(total) || 0));
+  const previousDisplay = counterDisplayTotal();
+  state.counterTotal = Math.max(Number(state.counterTotal) || 0, nextTotal);
+  state.counterLastFetchAt = fetchedAt;
+  if (save) saveState();
+  const nextDisplay = counterDisplayTotal();
+  renderCounterValue({ animate: nextDisplay !== previousDisplay });
+}
+
+function trackSiteView() {
+  sendAnalyticsEvent("site-view");
+}
+
+function trackAdClick(adId, position) {
+  sendAnalyticsEvent("ad-click", { adId, position });
+}
+
+function sendAnalyticsEvent(event, details = {}) {
+  if (!ANALYTICS_API_URL || !event) return;
+  const body = JSON.stringify({
+    event,
+    ...details,
+    path: window.location.pathname,
+    viewport: `${window.innerWidth}x${window.innerHeight}`
+  });
+
+  if (navigator.sendBeacon) {
+    try {
+      const payload = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon(ANALYTICS_API_URL, payload)) return;
+    } catch {
+      // Fall through to fetch.
+    }
+  }
+
+  fetch(ANALYTICS_API_URL, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    body,
+    cache: "no-store",
+    keepalive: true
+  }).catch(() => {});
+}
+
 function render() {
   pruneAllCooldowns();
   applyTheme();
   const topAd = renderAdBanner("top");
   const bottomAd = renderAdBanner("bottom");
   app.innerHTML = `
-    <div class="tracker-shell ${state.headerCollapsed ? "is-header-collapsed" : ""} ${topAd ? "has-top-ad" : ""}" data-view="${state.viewMode}">
+    <div class="tracker-shell ${state.headerCollapsed ? "is-header-collapsed" : ""} ${topAd ? "has-top-ad" : ""} ${state.paused ? "is-stopped" : ""} ${ui.interactionDenied ? "is-denied" : ""} ${ui.viewTransition ? "is-view-transitioning" : ""}" data-view="${state.viewMode}">
       ${renderTopbar()}
       ${renderGameTimer()}
       ${topAd}
@@ -253,10 +462,18 @@ function render() {
     </div>
     ${renderChampionModal()}
     ${renderSpellContext()}
+    ${renderStopPrompt()}
+    ${renderResetConfirm()}
   `;
 
   focusChampionSearch();
   requestAnimationFrame(updateTimelineCurrentLine);
+  if (ui.viewTransition) {
+    setTimeout(() => {
+      app.querySelector(".tracker-shell")?.classList.remove("is-view-transitioning");
+      ui.viewTransition = false;
+    }, 220);
+  }
 }
 
 function renderTopbar() {
@@ -269,35 +486,57 @@ function renderTopbar() {
         <span>SpellTracker</span>
         <small>Patch ${escapeHtml(appData.version)}</small>
       </div>
+      ${state.headerCollapsed ? renderStopButton("collapsed-stop-button") : ""}
       <div class="topbar-content">
         <div class="brand">
           <div class="brand-mark"><img src="${BRAND_ICON}" alt=""></div>
-          <div>
+          <div class="brand-copy">
             <h1>SpellTracker</h1>
             <p>Patch ${escapeHtml(appData.version)} &middot; by psyopgirl</p>
           </div>
         </div>
+        ${renderCooldownCounter()}
         <div class="topbar-actions">
-          <button class="control-button pause-button ${state.paused ? "is-on" : ""}" type="button" data-action="toggle-pause">
-            ${state.paused ? "Resume" : "Pause"}
+          ${state.headerCollapsed ? "" : renderStopButton("pause-button stop-button")}
+          <button class="control-button reset-button" type="button" data-action="reset-site" aria-label="Reset SpellTracker">
+            ${iconSvg("reset")}
           </button>
-          <button class="control-button reset-button" type="button" data-action="reset-site">Reset</button>
-          <button class="control-button view-button ${state.viewMode === "timeline" ? "is-on" : ""}" type="button" data-action="toggle-view">
-            ${state.viewMode === "timeline" ? "Timeline" : "Scoreboard"}
+          <button class="view-switch ${state.viewMode === "timeline" ? "is-timeline" : "is-scoreboard"}" type="button" data-action="toggle-view" role="switch" aria-checked="${state.viewMode === "timeline"}" aria-label="${state.viewMode === "timeline" ? "Switch to scoreboard view" : "Switch to timeline view"}">
+            <span class="view-switch-option">${iconSvg("scoreboard")}</span>
+            <span class="view-switch-option">${iconSvg("timeline")}</span>
+            <span class="view-switch-thumb" aria-hidden="true"></span>
           </button>
-          <button class="control-button flash-button" type="button" data-action="toggle-flash-key">
-            Flash on ${escapeHtml(state.flashKey)}
+          <button class="control-button flash-button" type="button" data-action="toggle-flash-key" aria-label="Flash on ${escapeHtml(state.flashKey)}">
+            <img src="${FLASH_ICON}" alt=""><span>${escapeHtml(state.flashKey)}</span>
           </button>
-          <button class="control-button theme-button" type="button" data-action="toggle-theme">
-            ${state.theme === "dark" ? "Dark" : "Light"}
+          <button class="control-button theme-button" type="button" data-action="toggle-theme" aria-label="${state.theme === "dark" ? "Use light mode" : "Use dark mode"}">
+            ${state.theme === "dark" ? iconSvg("moon") : iconSvg("sun")}
           </button>
           <button class="control-button mode-button ${state.mode === "aram" ? "is-aram" : ""}" type="button" data-action="toggle-mode">
             ${escapeHtml(MODES[state.mode].label)}
           </button>
-          <a class="control-button donate-button" href="https://ko-fi.com/psyopgirl" target="_blank" rel="noopener noreferrer">Donate</a>
+          <a class="control-button donate-button" href="https://ko-fi.com/psyopgirl" target="_blank" rel="noopener noreferrer" aria-label="Donate on Ko-fi">$</a>
         </div>
       </div>
     </header>
+  `;
+}
+
+function renderCooldownCounter() {
+  const total = counterDisplayTotal();
+  return `
+    <div class="cooldown-counter ${ui.counterAnimating ? "is-updating" : ""}" aria-label="${escapeHtml(formatCompactNumber(total))} cooldowns tracked">
+      <span data-counter-value>${escapeHtml(formatCounterNumber(total))}</span>
+      <span>Cooldowns tracked</span>
+    </div>
+  `;
+}
+
+function renderStopButton(extraClass = "") {
+  return `
+    <button class="control-button ${extraClass} ${state.paused ? "is-resume" : ""}" type="button" data-action="toggle-pause" aria-label="${state.paused ? "Resume SpellTracker" : "Stop SpellTracker"}">
+      ${state.paused ? iconSvg("play") : iconSvg("stop")}
+    </button>
   `;
 }
 
@@ -307,23 +546,23 @@ function renderGameTimer() {
     <section class="game-timer" aria-label="Game timer">
       <div class="game-time-readout">
         <span data-game-time>${formatGameTime(currentGameTimeMs())}</span>
-        <small data-game-timer-state>${running ? "Live" : "Paused"}</small>
+        <small data-game-timer-state>${gameTimerStateText()}</small>
       </div>
       <div class="game-timer-actions">
         <button class="control-button game-start-button ${running ? "is-on" : ""}" type="button" data-action="toggle-game-timer" aria-label="${running ? "Pause game timer" : "Start game timer"}">
-          ${running ? "&#9208;" : "&#9654;"}
+          ${running ? iconSvg("pause") : iconSvg("play")}
         </button>
-        <button class="control-button game-reset-button" type="button" data-action="reset-game-timer" aria-label="Reset game timer">&#8634;</button>
-        <button class="control-button game-clock-button ${ui.gameTimerMenuOpen ? "is-on" : ""}" type="button" data-action="toggle-game-time-menu" aria-label="Adjust game timer" aria-expanded="${ui.gameTimerMenuOpen}">&#9201;</button>
+        <button class="control-button game-reset-button" type="button" data-action="reset-game-timer" aria-label="Reset game timer">${iconSvg("reset")}</button>
+        <button class="control-button game-clock-button ${ui.gameTimerMenuOpen ? "is-on" : ""}" type="button" data-action="toggle-game-time-menu" aria-label="Adjust game timer" aria-expanded="${ui.gameTimerMenuOpen}">${iconSvg("clock")}</button>
+        ${ui.gameTimerMenuOpen || ui.gameTimerMenuClosing ? renderGameTimeMenu() : ""}
       </div>
-      ${ui.gameTimerMenuOpen ? renderGameTimeMenu() : ""}
     </section>
   `;
 }
 
 function renderGameTimeMenu() {
   return `
-    <div class="game-time-popover" role="menu" aria-label="Adjust game time">
+    <div class="game-time-popover ${ui.gameTimerMenuClosing ? "is-closing" : ""}" role="menu" aria-label="Adjust game time">
       ${ADJUSTMENTS.map((amount) => `
         <button type="button" data-action="adjust-game-time" data-delta="${amount}" aria-label="${amount > 0 ? "Add" : "Subtract"} ${Math.abs(amount)} seconds game time">
           ${amount > 0 ? "+" : ""}${amount}
@@ -331,6 +570,112 @@ function renderGameTimeMenu() {
       `).join("")}
     </div>
   `;
+}
+
+function gameTimerStateText() {
+  if (state.paused) return "Stopped";
+  return isGameTimerAdvancing() ? "Live" : "Paused";
+}
+
+function openGameTimeMenu() {
+  clearTimeout(ui.gameTimerMenuCloseTimer);
+  ui.gameTimerMenuOpen = true;
+  ui.gameTimerMenuClosing = false;
+  render();
+}
+
+function closeGameTimeMenu({ immediate = false, renderAfter = true } = {}) {
+  clearTimeout(ui.gameTimerMenuCloseTimer);
+  if (!ui.gameTimerMenuOpen && !ui.gameTimerMenuClosing) return;
+  ui.gameTimerMenuOpen = false;
+  if (immediate) {
+    ui.gameTimerMenuClosing = false;
+    if (renderAfter) render();
+    return;
+  }
+  ui.gameTimerMenuClosing = true;
+  if (renderAfter) render();
+  ui.gameTimerMenuCloseTimer = setTimeout(() => {
+    ui.gameTimerMenuClosing = false;
+    render();
+  }, GAME_TIME_MENU_FADE_MS);
+}
+
+function renderStopPrompt() {
+  if (!ui.stopPromptVisible) return "";
+  return `
+    <div class="stop-prompt" role="status" aria-live="polite">
+      ${iconSvg("play")}
+      <span>Press play to resume SpellTracker.</span>
+    </div>
+  `;
+}
+
+function renderResetConfirm() {
+  if (!ui.resetConfirmVisible) return "";
+  return `
+    <div class="reset-confirm-backdrop" data-action="close-reset-confirm">
+      <section class="reset-confirm-dialog" data-reset-panel role="dialog" aria-modal="true" aria-labelledby="reset-confirm-title">
+        <button class="icon-button reset-confirm-close" type="button" data-action="cancel-reset-site" aria-label="Cancel reset">x</button>
+        <div class="reset-confirm-icon">${iconSvg("reset")}</div>
+        <div class="reset-confirm-copy">
+          <h2 id="reset-confirm-title">Reset SpellTracker?</h2>
+          <p>This clears champions, spells, modifiers, cooldowns, and game time.</p>
+        </div>
+        <div class="reset-confirm-actions">
+          <button class="control-button reset-confirm-cancel" type="button" data-action="cancel-reset-site">Cancel</button>
+          <button class="control-button reset-confirm-accept" type="button" data-action="confirm-reset-site">
+            ${iconSvg("reset")} Reset
+          </button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function showStopPrompt() {
+  clearTimeout(ui.stopPromptTimer);
+  clearTimeout(ui.stopShakeTimer);
+  const wasVisible = ui.stopPromptVisible;
+  ui.stopPromptVisible = true;
+  ui.interactionDenied = true;
+  if (!wasVisible) {
+    render();
+  }
+
+  const shell = app.querySelector(".tracker-shell");
+  if (shell) {
+    shell.classList.remove("is-denied");
+    void shell.offsetWidth;
+    shell.classList.add("is-denied");
+  }
+
+  ui.stopShakeTimer = setTimeout(() => {
+    ui.interactionDenied = false;
+    app.querySelector(".tracker-shell")?.classList.remove("is-denied");
+  }, 360);
+  ui.stopPromptTimer = setTimeout(() => {
+    ui.stopPromptVisible = false;
+    ui.interactionDenied = false;
+    render();
+  }, STOP_PROMPT_MS);
+}
+
+function isActionBlockedWhileStopped(action) {
+  return ![
+    "toggle-pause",
+    "toggle-header",
+    "toggle-view",
+    "toggle-flash-key",
+    "toggle-theme",
+    "reset-site",
+    "confirm-reset-site",
+    "dismiss-ad",
+    "cancel-reset-site",
+    "close-reset-confirm",
+    "close-champion-picker",
+    "close-spell-context"
+  ].includes(action);
 }
 
 function renderPrimaryView() {
@@ -380,9 +725,14 @@ function renderUpcomingCooldowns() {
 
   return upcoming.map((entry) => `
     <span class="upcoming-chip" aria-label="${escapeHtml(`${entry.championName} ${entry.spell.name} ${formatGameTime(entry.endGameMs)}`)}">
-      <img class="upcoming-owner" src="${entry.ownerImage}" alt="">
-      <img class="upcoming-spell" src="${entry.spell.image}" alt="">
-      <b>${formatGameTime(entry.endGameMs)}</b>
+      <span class="upcoming-icons">
+        <img class="upcoming-owner" src="${entry.ownerImage}" alt="">
+        <img class="upcoming-spell" src="${entry.spell.image}" alt="">
+      </span>
+      <span class="upcoming-times">
+        <b>${escapeHtml(formatSeconds(entry.remainingMs / 1000, "ceil"))}</b>
+        <em>${escapeHtml(formatGameTime(entry.endGameMs))}</em>
+      </span>
     </span>
   `).join("");
 }
@@ -390,7 +740,7 @@ function renderUpcomingCooldowns() {
 function renderTimelineRow(player, playerIndex, windowStart, windowEnd) {
   const champion = championById(player.championId);
   const championImage = champion?.image || EMPTY_CHAMPION_IMAGE;
-  const championName = champion ? champion.name : "No champion";
+  const championName = championDisplayName(champion, playerIndex);
   const displayRole = displayRoleForPlayer(playerIndex);
   const roleIcon = ROLE_ICONS[displayRole.id];
   const haste = getTotalHaste(player);
@@ -417,6 +767,15 @@ function renderTimelineRow(player, playerIndex, windowStart, windowEnd) {
       </div>
     </article>
   `;
+}
+
+function championDisplayName(champion, playerIndex) {
+  if (champion) return champion.name;
+  const lane = LANES[playerIndex];
+  if (state.mode === "classic" && lane) {
+    return ROLE_PLACEHOLDER_LABELS[lane.id] || "No champion";
+  }
+  return "No champion";
 }
 
 function renderTimelineSpell(player, playerIndex, slot, slotIndex) {
@@ -478,7 +837,7 @@ function renderPlayer(player, playerIndex) {
   const champion = championById(player.championId);
   const haste = getTotalHaste(player);
   const championImage = champion?.image || EMPTY_CHAMPION_IMAGE;
-  const championName = champion ? champion.name : "No champion";
+  const championName = championDisplayName(champion, playerIndex);
   const roleIcon = ROLE_ICONS[displayRole.id];
 
   return `
@@ -572,8 +931,8 @@ function renderAdBanner(position) {
   }
 
   return `
-    <aside class="ad-banner ad-banner-${position}" data-ad-id="${position}" aria-label="Advertisement">
-      <a class="ad-creative" href="${escapeHtml(ad.href || "mailto:admin@spelltracker.lol")}" target="_blank" rel="noopener noreferrer" aria-label="${escapeHtml(ad.label || "Advertise with SpellTracker")}">
+    <aside class="ad-banner ad-banner-${position}" data-ad-id="${escapeHtml(ad.id || position)}" data-ad-position="${position}" aria-label="Advertisement">
+      <a class="ad-creative" href="${escapeHtml(ad.href || "mailto:admin@spelltracker.lol")}" target="_blank" rel="noopener noreferrer" data-action="ad-click" data-ad-id="${escapeHtml(ad.id || position)}" data-ad-position="${position}" aria-label="${escapeHtml(ad.label || "Advertise with SpellTracker")}">
         <img src="${escapeHtml(ad.src)}" alt="${escapeHtml(ad.label || "Advertisement")}">
       </a>
       <button class="ad-close" type="button" data-action="dismiss-ad" data-ad-id="${position}" aria-label="Close advertisement">X</button>
@@ -604,6 +963,25 @@ function renderModifierButtons(player, playerIndex) {
 function renderHasteValue(value) {
   const icon = appData.icons?.abilityHaste;
   return `${icon ? `<img class="haste-icon" src="${icon}" alt="">` : ""}<span>${Number(value) || 0}</span>`;
+}
+
+function iconSvg(name) {
+  const paths = {
+    play: `<path d="M8 5v14l11-7z"></path>`,
+    pause: `<path d="M7 5h4v14H7z"></path><path d="M13 5h4v14h-4z"></path>`,
+    stop: `<path d="M7 7h10v10H7z"></path>`,
+    reset: `<path d="M20 6v5h-5"></path><path d="M4 18v-5h5"></path><path d="M18.1 9A7 7 0 0 0 6.8 6.8L4 9.5"></path><path d="M5.9 15A7 7 0 0 0 17.2 17.2L20 14.5"></path>`,
+    clock: `<circle cx="12" cy="12" r="7.5"></circle><path d="M12 7.5V12l3 2"></path>`,
+    moon: `<path d="M17.5 14.8A7 7 0 0 1 9.2 6.5 7.2 7.2 0 1 0 17.5 14.8z"></path>`,
+    sun: `<circle cx="12" cy="12" r="4"></circle><path d="M12 2.5v2"></path><path d="M12 19.5v2"></path><path d="m4.9 4.9 1.4 1.4"></path><path d="m17.7 17.7 1.4 1.4"></path><path d="M2.5 12h2"></path><path d="M19.5 12h2"></path><path d="m4.9 19.1 1.4-1.4"></path><path d="m17.7 6.3 1.4-1.4"></path>`,
+    scoreboard: `<rect x="5" y="5" width="3.2" height="14" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="10.4" y="5" width="3.2" height="14" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="15.8" y="5" width="3.2" height="14" rx="0.7" fill="currentColor" stroke="none"></rect>`,
+    timeline: `<rect x="5" y="5" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="5" y="10.4" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="5" y="15.8" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect>`
+  };
+  return `
+    <svg class="ui-icon ui-icon-${name}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      ${paths[name] || ""}
+    </svg>
+  `;
 }
 
 function renderChampionModal() {
@@ -784,9 +1162,18 @@ function focusChampionSearch() {
 
 function handleClick(event) {
   const actionTarget = event.target.closest("[data-action]");
+  if (ui.gameTimerMenuOpen && !event.target.closest(".game-timer")) {
+    closeGameTimeMenu();
+    return;
+  }
   if (!actionTarget) return;
 
   const action = actionTarget.dataset.action;
+  if (action === "ad-click") {
+    trackAdClick(actionTarget.dataset.adId, actionTarget.dataset.adPosition);
+    return;
+  }
+
   if (action === "dismiss-ad") {
     const adId = actionTarget.dataset.adId;
     dismissAd(adId);
@@ -797,6 +1184,14 @@ function handleClick(event) {
     return;
   }
   if (action === "close-spell-context" && event.target.closest("[data-context-panel]") && actionTarget.classList.contains("context-backdrop")) {
+    return;
+  }
+  if (action === "close-reset-confirm" && event.target.closest("[data-reset-panel]") && actionTarget.classList.contains("reset-confirm-backdrop")) {
+    return;
+  }
+
+  if (state.paused && isActionBlockedWhileStopped(action)) {
+    showStopPrompt();
     return;
   }
 
@@ -814,6 +1209,8 @@ function handleClick(event) {
   if (action === "toggle-view") {
     state.viewMode = state.viewMode === "timeline" ? "scoreboard" : "timeline";
     ui.spellContext = null;
+    ui.viewTransition = true;
+    closeGameTimeMenu({ immediate: true, renderAfter: false });
     saveAndRender();
     return;
   }
@@ -824,8 +1221,11 @@ function handleClick(event) {
   }
 
   if (action === "toggle-game-time-menu") {
-    ui.gameTimerMenuOpen = !ui.gameTimerMenuOpen;
-    render();
+    if (ui.gameTimerMenuOpen) {
+      closeGameTimeMenu();
+    } else {
+      openGameTimeMenu();
+    }
     return;
   }
 
@@ -845,6 +1245,22 @@ function handleClick(event) {
   }
 
   if (action === "reset-site") {
+    ui.resetConfirmVisible = true;
+    ui.spellContext = null;
+    ui.championPickerIndex = null;
+    closeGameTimeMenu({ immediate: true, renderAfter: false });
+    render();
+    return;
+  }
+
+  if (action === "cancel-reset-site" || action === "close-reset-confirm") {
+    ui.resetConfirmVisible = false;
+    render();
+    return;
+  }
+
+  if (action === "confirm-reset-site") {
+    ui.resetConfirmVisible = false;
     resetSite();
     return;
   }
@@ -909,25 +1325,25 @@ function handleClick(event) {
   if (action === "fire-spell") {
     fireSpell(Number(actionTarget.dataset.player), Number(actionTarget.dataset.slot));
     ui.timelineRefreshBlockedUntil = Date.now() + 900;
-    saveAndRender();
+    saveCooldownChange();
     return;
   }
 
   if (action === "start-full-cooldown") {
     startFullCooldown(Number(actionTarget.dataset.player), Number(actionTarget.dataset.slot));
-    saveAndRender();
+    saveCooldownChange();
     return;
   }
 
   if (action === "adjust-cooldown") {
     adjustCooldown(Number(actionTarget.dataset.player), Number(actionTarget.dataset.slot), Number(actionTarget.dataset.delta));
-    saveAndRender();
+    saveCooldownChange();
     return;
   }
 
   if (action === "clear-slot") {
     clearSlot(Number(actionTarget.dataset.player), Number(actionTarget.dataset.slot));
-    saveAndRender();
+    saveCooldownChange();
     return;
   }
 
@@ -939,6 +1355,40 @@ function handleClick(event) {
 }
 
 function handleChange() {}
+
+function handleWheel(event) {
+  const gameReadout = event.target.closest(".game-time-readout");
+  if (ui.gameTimerMenuOpen && gameReadout) {
+    event.preventDefault();
+    if (state.paused) {
+      showStopPrompt();
+      return;
+    }
+    adjustGameTime(wheelSecondsFromDelta(event.deltaY));
+    return;
+  }
+
+  const cooldownTarget = event.target.closest("[data-spell-timer], .timeline-block em");
+  if (!ui.gameTimerMenuOpen) return;
+  if (!cooldownTarget) return;
+  const source = cooldownTarget.closest(".spell-panel[data-player][data-slot], .timeline-spell[data-player][data-slot], .timeline-block[data-player][data-slot]");
+  if (!source) return;
+  event.preventDefault();
+  if (state.paused) {
+    showStopPrompt();
+    return;
+  }
+  adjustCooldown(Number(source.dataset.player), Number(source.dataset.slot), wheelSecondsFromDelta(event.deltaY));
+  saveState();
+  updateTimers();
+}
+
+function wheelSecondsFromDelta(deltaY) {
+  const direction = deltaY < 0 ? 1 : -1;
+  const distance = Math.abs(Number(deltaY) || 0);
+  const magnitude = clamp(Math.round(Math.max(1, Math.pow(distance / 42, 1.2))), 1, 30);
+  return direction * magnitude;
+}
 
 function handleInput(event) {
   const target = event.target;
@@ -1028,6 +1478,8 @@ function resetSite() {
   ui.championQuery = "";
   ui.championActiveIndex = 0;
   ui.spellContext = null;
+  ui.resetConfirmVisible = false;
+  closeGameTimeMenu({ immediate: true, renderAfter: false });
   saveAndRender();
 }
 
@@ -1052,6 +1504,10 @@ function applyTheme() {
 }
 
 function toggleGameTimer() {
+  if (state.paused) {
+    showStopPrompt();
+    return;
+  }
   if (isGameTimerAdvancing()) {
     state.gameTimeMs = currentGameTimeMs();
     state.gameStartedAt = null;
@@ -1067,7 +1523,11 @@ function toggleGameTimer() {
 }
 
 function resetGameTimer() {
-  ui.gameTimerMenuOpen = false;
+  if (state.paused) {
+    showStopPrompt();
+    return;
+  }
+  closeGameTimeMenu({ immediate: true, renderAfter: false });
   const deltaMs = -currentGameTimeMs();
   shiftAllCooldownGameTimes(deltaMs);
   state.gameTimeMs = 0;
@@ -1076,7 +1536,10 @@ function resetGameTimer() {
 }
 
 function adjustGameTime(seconds) {
-  ui.gameTimerMenuOpen = false;
+  if (state.paused) {
+    showStopPrompt();
+    return;
+  }
   const currentTime = currentGameTimeMs();
   const nextTime = Math.max(0, currentTime + seconds * 1000);
   shiftAllCooldownGameTimes(nextTime - currentTime);
@@ -1091,17 +1554,33 @@ function isGameTimerAdvancing() {
 
 function currentGameTimeMs() {
   if (!state) return 0;
+  const currentMs = rawGameTimeMs();
+  if (currentMs > MAX_GAME_TIME_MS) {
+    resetExpiredGameTimer();
+    return 0;
+  }
+  return currentMs;
+}
+
+function rawGameTimeMs() {
   if (isGameTimerAdvancing()) {
     return Math.max(0, (Number(state.gameTimeMs) || 0) + Date.now() - Number(state.gameStartedAt));
   }
   return Math.max(0, Number(state.gameTimeMs) || 0);
 }
 
+function resetExpiredGameTimer() {
+  state.gameTimeMs = 0;
+  state.gameStartedAt = null;
+  state.gameTimerRunning = false;
+  saveState();
+}
+
 function updateGameTimerDisplay() {
   const timer = app.querySelector("[data-game-time]");
   const stateText = app.querySelector("[data-game-timer-state]");
   if (timer) timer.textContent = formatGameTime(currentGameTimeMs());
-  if (stateText) stateText.textContent = isGameTimerAdvancing() ? "Live" : "Paused";
+  if (stateText) stateText.textContent = gameTimerStateText();
 }
 
 function resumeTrackingClock() {
@@ -1126,11 +1605,13 @@ function shiftAllCooldownGameTimes(deltaMs) {
 
 function togglePause() {
   if (state.paused) {
+    ui.stopPromptVisible = false;
     resumeTrackingClock();
     if (state.gameTimerRunning) {
       state.gameStartedAt = Date.now();
     }
   } else {
+    closeGameTimeMenu({ immediate: true, renderAfter: false });
     state.gameTimeMs = currentGameTimeMs();
     state.gameStartedAt = null;
     state.paused = true;
@@ -1182,7 +1663,15 @@ function adjustCooldown(playerIndex, slotIndex, seconds) {
     return;
   }
 
-  active[0] = adjustCooldownEntry(active[0], seconds * 1000, now);
+  const adjusted = adjustCooldownEntry(active[0], seconds * 1000, now);
+  if (cooldownEndAt(adjusted) <= now) {
+    if (isCountableCooldown(adjusted)) {
+      addPendingCooldownCompletions(1);
+    }
+    active.shift();
+  } else {
+    active[0] = adjusted;
+  }
   slot.cooldowns = sortCooldowns(active.filter((cooldown) => cooldownEndAt(cooldown) > now));
 }
 
@@ -1358,6 +1847,7 @@ function collectUpcomingCooldowns() {
 
 function updateTimers() {
   if (!state || !appData) return;
+  pruneAllCooldowns();
   updateGameTimerDisplay();
   const panels = app.querySelectorAll(".spell-panel[data-player][data-slot], .timeline-spell[data-player][data-slot]");
   for (const panel of panels) {
@@ -1520,13 +2010,36 @@ function getSlotStatus(player, slot) {
 function pruneAllCooldowns() {
   if (!state) return;
   const now = referenceNow();
+  let completedCount = 0;
+  let changed = false;
   for (const player of state.players) {
     for (const slot of player.slots) {
-      slot.cooldowns = sortCooldowns(slot.cooldowns
-        .map(normalizeCooldownEntry)
-        .filter((cooldown) => cooldown && cooldownEndAt(cooldown) > now));
+      const nextCooldowns = [];
+      for (const cooldown of slot.cooldowns.map(normalizeCooldownEntry)) {
+        if (!cooldown) {
+          changed = true;
+          continue;
+        }
+        if (cooldownEndAt(cooldown) > now) {
+          nextCooldowns.push(cooldown);
+        } else {
+          completedCount += isCountableCooldown(cooldown) ? 1 : 0;
+          changed = true;
+        }
+      }
+      slot.cooldowns = sortCooldowns(nextCooldowns);
     }
   }
+  if (completedCount > 0) {
+    addPendingCooldownCompletions(completedCount);
+  } else if (changed) {
+    saveState();
+  }
+}
+
+function isCountableCooldown(cooldown) {
+  const entry = normalizeCooldownEntry(cooldown);
+  return Boolean(entry && Number(entry.durationMs) > 0);
 }
 
 function saveAndRender() {
@@ -1716,6 +2229,14 @@ function formatSeconds(value, mode = "round") {
   return `${minutes}:${String(rest).padStart(2, "0")}`;
 }
 
+function formatCounterNumber(value) {
+  return formatCompactNumber(value);
+}
+
+function formatCompactNumber(value) {
+  return Math.max(0, Math.floor(Number(value) || 0)).toLocaleString("en-US");
+}
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
@@ -1725,6 +2246,19 @@ function normalizeSearch(value) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f'\u2019. -]/g, "")
     .toLowerCase();
+}
+
+function preventDefaultSiteMenu(event) {
+  if (event.target.closest("#app")) {
+    event.preventDefault();
+  }
+}
+
+function preventSiteSelection(event) {
+  if (event.target.closest("input, textarea")) return;
+  if (event.target.closest("#app")) {
+    event.preventDefault();
+  }
 }
 
 function isSubsequence(needle, value) {
