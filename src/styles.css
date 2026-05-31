@@ -61,6 +61,7 @@
 * {
   box-sizing: border-box;
   -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 html,
@@ -448,6 +449,7 @@ a {
 
 .reset-button,
 .mode-button,
+.info-button,
 .theme-button,
 .donate-button {
   width: 48px;
@@ -541,6 +543,7 @@ a {
 
 .theme-button,
 .mode-button,
+.info-button,
 .donate-button {
   padding-inline: 6px;
 }
@@ -666,12 +669,44 @@ a {
   cursor: ns-resize;
 }
 
+.game-time-readout.is-adjustable {
+  cursor: text;
+}
+
 .game-time-readout span {
   color: var(--text);
   font-size: clamp(22px, 3.1vh, 30px);
   font-weight: 900;
   line-height: 1;
   font-variant-numeric: tabular-nums;
+}
+
+.game-time-input {
+  width: 4.8ch;
+  min-width: 0;
+  height: 1em;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  caret-color: var(--accent-strong);
+  padding: 0;
+  outline: none;
+  font-size: clamp(22px, 3.1vh, 30px);
+  font-weight: 900;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  animation: time-input-flash 520ms ease both;
+}
+
+@keyframes time-input-flash {
+  0%,
+  100% {
+    text-shadow: 0 0 0 rgba(255, 255, 255, 0);
+  }
+  42% {
+    text-shadow: 0 0 12px color-mix(in srgb, var(--accent-strong) 55%, transparent);
+  }
 }
 
 .game-time-readout small {
@@ -689,6 +724,12 @@ a {
   gap: 6px;
 }
 
+.game-clock-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
 .game-start-button,
 .game-reset-button,
 .game-clock-button {
@@ -699,7 +740,8 @@ a {
 .game-time-popover {
   position: absolute;
   z-index: 25;
-  right: 0;
+  left: 50%;
+  right: auto;
   top: calc(100% + 5px);
   width: min(360px, calc(100vw - 24px));
   min-width: 0;
@@ -711,26 +753,26 @@ a {
   background: var(--surface);
   box-shadow: var(--shadow);
   opacity: 1;
-  transform: translateY(0);
+  transform: translateX(-50%) translateY(0);
   transition: opacity 160ms ease, transform 160ms ease;
 }
 
 .game-time-popover::before {
   content: "";
   position: absolute;
-  right: 26px;
+  left: 50%;
   top: -6px;
   width: 10px;
   height: 10px;
   border-left: 1px solid var(--line);
   border-top: 1px solid var(--line);
   background: var(--surface);
-  transform: rotate(45deg);
+  transform: translateX(-50%) rotate(45deg);
 }
 
 .game-time-popover.is-closing {
   opacity: 0;
-  transform: translateY(-3px);
+  transform: translateX(-50%) translateY(-3px);
   pointer-events: none;
 }
 
@@ -783,7 +825,7 @@ a {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto auto auto;
+  grid-template-rows: auto auto auto;
   align-content: center;
   gap: clamp(5px, 1vh, 8px);
   padding: 8px;
@@ -1119,7 +1161,7 @@ a {
 
 .player-name-section {
   min-width: 0;
-  min-height: 18px;
+  min-height: 24px;
   display: grid;
   align-items: center;
   justify-items: center;
@@ -1134,8 +1176,8 @@ a {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
-  font-size: clamp(12px, 1.25vw, 16px);
-  line-height: 1;
+  font-size: clamp(13px, 1.35vw, 18px);
+  line-height: 1.12;
   letter-spacing: 0;
 }
 
@@ -1224,6 +1266,7 @@ a {
 
 .modal-backdrop,
 .context-backdrop,
+.help-backdrop,
 .reset-confirm-backdrop {
   position: fixed;
   inset: 0;
@@ -1231,6 +1274,26 @@ a {
   display: grid;
   padding: calc(12px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
   background: rgba(0, 0, 0, 0.74);
+  animation: overlay-fade-in 180ms ease both;
+}
+
+.modal-backdrop.is-closing,
+.context-backdrop.is-closing,
+.help-backdrop.is-closing,
+.reset-confirm-backdrop.is-closing,
+.stop-prompt.is-closing {
+  animation: overlay-fade-out 180ms ease both;
+  pointer-events: none;
+}
+
+@keyframes overlay-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes overlay-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
 }
 
 .modal-backdrop {
@@ -1239,6 +1302,111 @@ a {
 
 .context-backdrop {
   place-items: center;
+}
+
+.help-backdrop {
+  z-index: 58;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.58);
+}
+
+.help-dialog {
+  position: relative;
+  width: min(94vw, 720px);
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  animation: reset-confirm-in 160ms ease both;
+}
+
+.help-dialog h2 {
+  margin: 0;
+  padding-right: 28px;
+  font-size: clamp(22px, 2.2vw, 28px);
+  line-height: 1;
+}
+
+.help-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.help-grid section {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.help-grid h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.help-grid p {
+  margin: 0;
+  color: var(--muted);
+  font-size: clamp(12px, 1.1vw, 14px);
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.help-grid strong,
+.help-grid span {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.help-grid kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  min-height: 19px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-bottom-color: var(--muted);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.92em;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.help-close {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  min-height: 26px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.help-close:hover,
+.help-close:active {
+  border-color: transparent;
+  background: transparent;
+  transform: none;
 }
 
 .reset-confirm-backdrop {
@@ -1442,6 +1610,34 @@ a {
   background: var(--surface);
   box-shadow: var(--shadow);
   overflow: hidden;
+  animation: panel-in 180ms ease both;
+}
+
+.champion-modal.is-closing,
+.spell-context.is-closing {
+  animation: panel-out 180ms ease both;
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes panel-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
 }
 
 .spell-context {
@@ -1478,8 +1674,31 @@ a {
 }
 
 .context-title span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
   color: var(--muted);
   font-size: 12px;
+}
+
+.context-cooldown-pill {
+  display: inline-grid;
+  place-items: center;
+  min-width: 42px;
+  min-height: 20px;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-cooldown-pill:empty {
+  display: none;
 }
 
 .icon-button {
@@ -1527,6 +1746,12 @@ a {
 .champion-grid {
   grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
   overflow: auto;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.champion-grid.is-refreshing {
+  opacity: 0.36;
+  transform: translateY(2px);
 }
 
 .champion-option {
@@ -1681,7 +1906,7 @@ a {
 
 .upcoming-strip {
   min-width: 0;
-  min-height: 50px;
+  min-height: 58px;
   display: grid;
   grid-template-columns: repeat(10, minmax(0, 1fr));
   align-items: center;
@@ -1706,12 +1931,13 @@ a {
 
 .upcoming-chip {
   min-width: 0;
-  height: 42px;
+  height: 50px;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: 1fr;
   align-items: stretch;
-  gap: 2px;
-  padding: 3px;
+  gap: 4px;
+  padding: 4px;
   border: 1px solid var(--line-soft);
   background: var(--surface-2);
   border-radius: 5px;
@@ -1724,14 +1950,15 @@ a {
 .upcoming-icons {
   min-width: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(2, 22px);
+  align-content: center;
   justify-items: center;
-  gap: 3px;
+  gap: 2px;
 }
 
 .upcoming-chip img {
-  width: min(24px, 100%);
-  height: min(24px, 100%);
+  width: 22px;
+  height: 22px;
   object-fit: cover;
   border-radius: 3px;
 }
@@ -1747,32 +1974,46 @@ a {
 .upcoming-times {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: repeat(2, minmax(0, 1fr));
   align-items: center;
-  gap: 3px;
+  gap: 2px;
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
 
+.upcoming-times > span {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(max-content, 1fr);
+  align-items: center;
+  gap: 3px;
+}
+
+.upcoming-times small,
 .upcoming-times b,
 .upcoming-times em {
   min-width: 0;
-  overflow: hidden;
-  text-align: center;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
   font-style: normal;
   font-weight: 900;
 }
 
+.upcoming-times small {
+  color: var(--muted);
+  font-size: 7.5px;
+  text-transform: uppercase;
+}
+
 .upcoming-times b {
   color: var(--green);
-  font-size: clamp(11px, 0.95vw, 14px);
+  font-size: clamp(10px, 0.9vw, 14px);
 }
 
 .upcoming-times em {
-  color: var(--muted);
-  font-size: clamp(10px, 0.82vw, 12px);
+  color: var(--text);
+  font-size: clamp(9.5px, 0.82vw, 12px);
 }
 
 .timeline-board {
@@ -1809,6 +2050,9 @@ a {
 }
 
 .timeline-row {
+  --timeline-spell-size: clamp(52px, min(4.2vw, 7.8vh), 68px);
+  --timeline-spell-action: clamp(22px, calc(var(--timeline-spell-size) * 0.5), 28px);
+  --timeline-champ-size: clamp(62px, calc(var(--timeline-spell-size) * 1.18), 82px);
   min-width: 0;
   min-height: 0;
   display: grid;
@@ -1821,10 +2065,10 @@ a {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr) auto;
+  grid-template-columns: var(--timeline-champ-size) minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
-  padding: 6px;
+  gap: 6px;
+  padding: 4px;
   border: 1px solid var(--line-soft);
   background: var(--surface-2);
   overflow: hidden;
@@ -1832,9 +2076,9 @@ a {
 
 .timeline-champion {
   position: relative;
-  width: 72px;
-  height: 72px;
-  min-height: 72px;
+  width: var(--timeline-champ-size);
+  height: var(--timeline-champ-size);
+  min-height: var(--timeline-champ-size);
   padding: 0;
   border-radius: 6px;
   overflow: hidden;
@@ -1893,22 +2137,22 @@ a {
 
 .timeline-spells {
   display: grid;
-  grid-template-rows: repeat(2, 52px);
+  grid-template-rows: repeat(2, var(--timeline-spell-size));
   gap: 5px;
 }
 
 .timeline-spell {
   --cooldown-fill: 0%;
   display: grid;
-  grid-template-columns: 52px 26px;
+  grid-template-columns: var(--timeline-spell-size) var(--timeline-spell-action);
   gap: 3px;
 }
 
 .timeline-spell .spell-button {
   grid-row: 1 / -1;
-  width: 52px;
-  height: 52px;
-  min-height: 52px;
+  width: var(--timeline-spell-size);
+  height: var(--timeline-spell-size);
+  min-height: var(--timeline-spell-size);
   border-radius: 5px;
 }
 
@@ -2045,10 +2289,19 @@ a {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 10px;
+  font-size: clamp(11px, 0.9vw, 14px);
   font-style: normal;
   font-weight: 900;
   line-height: 1;
+}
+
+.timeline-block b {
+  flex: 1 1 auto;
+}
+
+.timeline-block em {
+  flex: 0 0 auto;
+  max-width: 45%;
 }
 
 @media (max-width: 1120px) and (orientation: landscape) {
@@ -2119,6 +2372,7 @@ a {
   .collapsed-stop-button,
   .reset-button,
   .mode-button,
+  .info-button,
   .theme-button,
   .donate-button {
     width: 48px;
@@ -2150,7 +2404,7 @@ a {
   }
 
   .player-card {
-    grid-template-rows: auto auto auto auto;
+    grid-template-rows: minmax(0, 1fr) auto auto;
     align-content: center;
     gap: 1px;
     padding: 4px 5px;
@@ -2329,6 +2583,7 @@ a {
   .collapsed-stop-button,
   .reset-button,
   .mode-button,
+  .info-button,
   .theme-button,
   .donate-button {
     width: 48px;
@@ -2486,6 +2741,7 @@ a {
   .collapsed-stop-button,
   .reset-button,
   .mode-button,
+  .info-button,
   .theme-button,
   .donate-button,
   .game-start-button,
@@ -2512,7 +2768,8 @@ a {
     gap: 5px;
   }
 
-  .game-time-readout span {
+  .game-time-readout span,
+  .game-time-input {
     font-size: clamp(20px, 5.8vw, 27px);
   }
 
@@ -2525,7 +2782,8 @@ a {
   }
 
   .game-time-popover {
-    right: 6px;
+    left: 50%;
+    right: auto;
     width: min(360px, calc(100vw - 16px));
     grid-template-columns: repeat(6, minmax(0, 1fr));
   }
@@ -2592,6 +2850,18 @@ a {
     padding: 8px;
   }
 
+  .help-dialog {
+    width: min(94vw, 560px);
+    max-height: calc(100dvh - 16px);
+    overflow: hidden;
+  }
+
+  .help-grid {
+    grid-template-columns: 1fr;
+    overflow: auto;
+    padding-right: 2px;
+  }
+
   .context-head {
     gap: 8px;
   }
@@ -2646,19 +2916,23 @@ a {
   }
 
   .upcoming-chip {
-    height: 48px;
-    grid-template-columns: none;
-    grid-template-rows: minmax(0, 1fr) auto;
+    height: 50px;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 1fr;
     font-size: 9px;
   }
 
+  .upcoming-icons {
+    grid-template-columns: repeat(2, 20px);
+  }
+
   .upcoming-chip img {
-    width: min(22px, 100%);
-    height: min(22px, 100%);
+    width: 20px;
+    height: 20px;
   }
 
   .upcoming-times b {
-    font-size: 11px;
+    font-size: 11.5px;
   }
 
   .upcoming-times em {
@@ -2722,6 +2996,7 @@ a {
 
   .timeline-track-current {
     display: block;
+    z-index: 24;
   }
 
   .spell-timer {
@@ -2793,7 +3068,8 @@ a {
     padding: 4px 6px;
   }
 
-  .game-time-readout span {
+  .game-time-readout span,
+  .game-time-input {
     font-size: 20px;
   }
 
@@ -2926,7 +3202,8 @@ a {
     gap: 4px;
   }
 
-  .game-time-readout span {
+  .game-time-readout span,
+  .game-time-input {
     font-size: clamp(18px, 5.5vh, 24px);
   }
 
@@ -3026,9 +3303,13 @@ a {
     font-size: 7px;
   }
 
+  .upcoming-icons {
+    grid-template-columns: repeat(2, 13px);
+  }
+
   .upcoming-chip img {
-    width: min(15px, 100%);
-    height: min(15px, 100%);
+    width: 13px;
+    height: 13px;
   }
 
   .upcoming-times {

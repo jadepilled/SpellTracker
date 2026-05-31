@@ -9,6 +9,8 @@ const ANALYTICS_API_URL = window.SPELLTRACKER_ANALYTICS_ENDPOINT
 const COUNTER_REFRESH_MS = 5 * 60 * 1000;
 const COUNTER_SYNC_DEBOUNCE_MS = 2200;
 const COUNTER_BATCH_LIMIT = 100;
+const COUNTER_LOCAL_EVENT_LIMIT = 10;
+const MIN_TRACKED_COOLDOWN_RATIO = 0.5;
 const EMPTY_CHAMPION_IMAGE = "./assets/champion/None.png";
 const BRAND_ICON = "./assets/favicon.png";
 const ROLE_ICONS = {
@@ -46,8 +48,9 @@ const MODES = {
   }
 };
 
-const ADJUSTMENTS = [-1, -5, -30, 1, 5, 30];
+const ADJUSTMENTS = [-1, -5, -15, 1, 5, 15];
 const GAME_TIME_MENU_FADE_MS = 160;
+const OVERLAY_FADE_MS = 180;
 const STOP_PROMPT_MS = 1800;
 const TIMELINE_PAST_MS = 30 * 1000;
 const TIMELINE_FUTURE_MS = 5 * 60 * 1000;
@@ -83,13 +86,25 @@ const ui = {
   championQuery: "",
   championActiveIndex: 0,
   spellContext: null,
+  spellContextClosing: false,
+  spellContextCloseTimer: null,
   gameTimerMenuOpen: false,
   gameTimerMenuClosing: false,
   gameTimerMenuCloseTimer: null,
+  ctrlClockHeld: false,
+  gameTimeEditing: false,
+  gameTimeDraft: "",
+  gameTimeEditInitialText: "",
   stopPromptVisible: false,
+  stopPromptClosing: false,
   stopPromptTimer: null,
   stopShakeTimer: null,
   resetConfirmVisible: false,
+  resetConfirmClosing: false,
+  resetConfirmCloseTimer: null,
+  helpVisible: false,
+  helpClosing: false,
+  helpCloseTimer: null,
   interactionDenied: false,
   viewTransition: false,
   counterSyncing: false,
@@ -99,6 +114,9 @@ const ui = {
   counterAnimationTimer: null,
   dismissedAds: new Set(),
   adSlots: {},
+  championPickerClosing: false,
+  championPickerCloseTimer: null,
+  championGridRefreshing: false,
   lastTimelineRenderAt: 0,
   timelineRefreshBlockedUntil: 0
 };
@@ -119,11 +137,13 @@ async function init() {
     app.addEventListener("click", handleClick);
     app.addEventListener("change", handleChange);
     app.addEventListener("input", handleInput);
+    app.addEventListener("focusout", handleFocusOut);
     app.addEventListener("wheel", handleWheel, { passive: false });
     document.addEventListener("contextmenu", preventDefaultSiteMenu);
     document.addEventListener("dragstart", preventDefaultSiteMenu);
     document.addEventListener("selectstart", preventSiteSelection);
     window.addEventListener("keydown", handleKeydown);
+    window.addEventListener("keyup", handleKeyup);
     window.addEventListener("resize", () => requestAnimationFrame(updateTimelineCurrentLine));
     render();
     updateTimers();
@@ -162,7 +182,7 @@ function makeDefaultState(mode = "classic") {
     gameTimeMs: 0,
     gameStartedAt: null,
     gameTimerRunning: false,
-    counterTotal: 0,
+    counterTotal: "0",
     counterPending: 0,
     counterLastFetchAt: 0,
     players: LANES.map((lane, laneIndex) => ({
@@ -190,7 +210,7 @@ function hydrateState(saved) {
   const mode = saved.mode === "aram" ? "aram" : "classic";
   const theme = saved.theme === "light" ? "light" : "dark";
   const flashKey = saved.flashKey === "F" ? "F" : "D";
-  const viewMode = saved.viewMode === "timeline" ? "timeline" : "scoreboard";
+  const viewMode = "scoreboard";
   const paused = Boolean(saved.paused);
   const gameTimerRunning = Boolean(saved.gameTimerRunning);
   const gameStartedAt = gameTimerRunning && !paused && Number.isFinite(Number(saved.gameStartedAt))
@@ -214,7 +234,7 @@ function hydrateState(saved) {
     gameTimeMs: Math.max(0, Number(saved.gameTimeMs) || 0),
     gameStartedAt,
     gameTimerRunning,
-    counterTotal: Math.max(0, Number(saved.counterTotal) || 0),
+    counterTotal: parseCounterValue(saved.counterTotal).toString(),
     counterPending: Math.max(0, Number(saved.counterPending) || 0),
     counterLastFetchAt: Math.max(0, Number(saved.counterLastFetchAt) || 0),
     players: fallback.players.map((player, playerIndex) => {
@@ -279,6 +299,10 @@ function saveState() {
 
 function saveCooldownChange() {
   saveState();
+  if (ui.spellContext) {
+    render();
+    return;
+  }
   if (state.viewMode === "timeline") {
     render();
     return;
@@ -296,7 +320,7 @@ function initCooldownCounter() {
 }
 
 function counterDisplayTotal() {
-  return Math.max(0, Number(state?.counterTotal) || 0) + Math.max(0, Number(state?.counterPending) || 0);
+  return parseCounterValue(state?.counterTotal) + BigInt(Math.max(0, Math.floor(Number(state?.counterPending) || 0)));
 }
 
 function renderCounterValue({ animate = false } = {}) {
@@ -327,7 +351,8 @@ function queueCounterAnimation() {
 function addPendingCooldownCompletions(amount) {
   const safeAmount = Math.max(0, Math.floor(Number(amount) || 0));
   if (!safeAmount || !state) return;
-  state.counterPending = Math.max(0, Number(state.counterPending) || 0) + safeAmount;
+  const cappedAmount = Math.min(safeAmount, COUNTER_LOCAL_EVENT_LIMIT);
+  state.counterPending = Math.max(0, Number(state.counterPending) || 0) + cappedAmount;
   saveState();
   renderCounterValue({ animate: true });
   scheduleCounterSync();
@@ -378,7 +403,7 @@ async function flushCooldownCounter() {
     if (!response.ok) throw new Error(`Counter sync failed: ${response.status}`);
     const data = await response.json();
     state.counterPending = Math.max(0, Number(state.counterPending || 0) - amount);
-    state.counterTotal = Math.max(Number(state.counterTotal) || 0, Math.max(0, Math.floor(Number(data.total) || 0)));
+    state.counterTotal = maxCounterString(state.counterTotal, data.total);
     state.counterLastFetchAt = Date.now();
     saveState();
     renderCounterValue({ animate: counterDisplayTotal() !== previousDisplay });
@@ -395,9 +420,9 @@ async function flushCooldownCounter() {
 
 function applyCounterTotal(total, fetchedAt = Date.now(), { save = true } = {}) {
   if (!state) return;
-  const nextTotal = Math.max(0, Math.floor(Number(total) || 0));
+  const nextTotal = parseCounterValue(total);
   const previousDisplay = counterDisplayTotal();
-  state.counterTotal = Math.max(Number(state.counterTotal) || 0, nextTotal);
+  state.counterTotal = maxCounterString(state.counterTotal, nextTotal);
   state.counterLastFetchAt = fetchedAt;
   if (save) saveState();
   const nextDisplay = counterDisplayTotal();
@@ -460,13 +485,13 @@ function render() {
         </footer>
       </div>
     </div>
-    ${renderChampionModal()}
-    ${renderSpellContext()}
-    ${renderStopPrompt()}
-    ${renderResetConfirm()}
+    <div class="overlay-root" data-overlay-root>
+      ${renderOverlays()}
+    </div>
   `;
 
   focusChampionSearch();
+  focusGameTimeInput();
   requestAnimationFrame(updateTimelineCurrentLine);
   if (ui.viewTransition) {
     setTimeout(() => {
@@ -474,6 +499,27 @@ function render() {
       ui.viewTransition = false;
     }, 220);
   }
+}
+
+function renderOverlays() {
+  return `
+    ${renderChampionModal()}
+    ${renderSpellContext()}
+    ${renderHelpDialog()}
+    ${renderStopPrompt()}
+    ${renderResetConfirm()}
+  `;
+}
+
+function renderOverlaysOnly() {
+  const overlayRoot = app.querySelector("[data-overlay-root]");
+  if (!overlayRoot) {
+    render();
+    return;
+  }
+  overlayRoot.innerHTML = renderOverlays();
+  focusChampionSearch();
+  focusGameTimeInput();
 }
 
 function renderTopbar() {
@@ -515,6 +561,9 @@ function renderTopbar() {
           <button class="control-button mode-button ${state.mode === "aram" ? "is-aram" : ""}" type="button" data-action="toggle-mode">
             ${escapeHtml(MODES[state.mode].label)}
           </button>
+          <button class="control-button info-button" type="button" data-action="toggle-help" aria-label="SpellTracker help">
+            ${iconSvg("info")}
+          </button>
           <a class="control-button donate-button" href="https://ko-fi.com/psyopgirl" target="_blank" rel="noopener noreferrer" aria-label="Donate on Ko-fi">$</a>
         </div>
       </div>
@@ -542,10 +591,14 @@ function renderStopButton(extraClass = "") {
 
 function renderGameTimer() {
   const running = isGameTimerAdvancing();
+  const clockActive = isClockControlActive();
+  const displayedTime = formatGameTime(currentGameTimeMs());
   return `
     <section class="game-timer" aria-label="Game timer">
-      <div class="game-time-readout">
-        <span data-game-time>${formatGameTime(currentGameTimeMs())}</span>
+      <div class="game-time-readout ${clockActive ? "is-adjustable" : ""} ${ui.gameTimeEditing ? "is-editing" : ""}" data-game-time-readout>
+        ${ui.gameTimeEditing
+          ? `<input class="game-time-input" data-action="game-time-input" inputmode="numeric" autocomplete="off" spellcheck="false" value="${escapeHtml(ui.gameTimeDraft || displayedTime)}" aria-label="Set game time">`
+          : `<span data-game-time>${displayedTime}</span>`}
         <small data-game-timer-state>${gameTimerStateText()}</small>
       </div>
       <div class="game-timer-actions">
@@ -553,8 +606,10 @@ function renderGameTimer() {
           ${running ? iconSvg("pause") : iconSvg("play")}
         </button>
         <button class="control-button game-reset-button" type="button" data-action="reset-game-timer" aria-label="Reset game timer">${iconSvg("reset")}</button>
-        <button class="control-button game-clock-button ${ui.gameTimerMenuOpen ? "is-on" : ""}" type="button" data-action="toggle-game-time-menu" aria-label="Adjust game timer" aria-expanded="${ui.gameTimerMenuOpen}">${iconSvg("clock")}</button>
-        ${ui.gameTimerMenuOpen || ui.gameTimerMenuClosing ? renderGameTimeMenu() : ""}
+        <span class="game-clock-wrap">
+          <button class="control-button game-clock-button ${clockActive ? "is-on" : ""}" type="button" data-action="toggle-game-time-menu" aria-label="Adjust game timer" aria-expanded="${ui.gameTimerMenuOpen}">${iconSvg("clock")}</button>
+          ${ui.gameTimerMenuOpen || ui.gameTimerMenuClosing ? renderGameTimeMenu() : ""}
+        </span>
       </div>
     </section>
   `;
@@ -570,6 +625,10 @@ function renderGameTimeMenu() {
       `).join("")}
     </div>
   `;
+}
+
+function isClockControlActive(event = null) {
+  return Boolean(ui.gameTimerMenuOpen || ui.ctrlClockHeld || event?.ctrlKey);
 }
 
 function gameTimerStateText() {
@@ -601,10 +660,50 @@ function closeGameTimeMenu({ immediate = false, renderAfter = true } = {}) {
   }, GAME_TIME_MENU_FADE_MS);
 }
 
+function openHelp() {
+  clearTimeout(ui.helpCloseTimer);
+  ui.helpVisible = true;
+  ui.helpClosing = false;
+}
+
+function closeHelp({ immediate = false, renderAfter = true } = {}) {
+  clearTimeout(ui.helpCloseTimer);
+  if (!ui.helpVisible && !ui.helpClosing) return;
+  ui.helpVisible = false;
+  if (immediate) {
+    ui.helpClosing = false;
+    if (renderAfter) renderOverlaysOnly();
+    return;
+  }
+  ui.helpClosing = true;
+  if (renderAfter) renderOverlaysOnly();
+  ui.helpCloseTimer = setTimeout(() => {
+    ui.helpClosing = false;
+    renderOverlaysOnly();
+  }, OVERLAY_FADE_MS);
+}
+
+function closeResetConfirm({ immediate = false, renderAfter = true } = {}) {
+  clearTimeout(ui.resetConfirmCloseTimer);
+  if (!ui.resetConfirmVisible && !ui.resetConfirmClosing) return;
+  ui.resetConfirmVisible = false;
+  if (immediate) {
+    ui.resetConfirmClosing = false;
+    if (renderAfter) renderOverlaysOnly();
+    return;
+  }
+  ui.resetConfirmClosing = true;
+  if (renderAfter) renderOverlaysOnly();
+  ui.resetConfirmCloseTimer = setTimeout(() => {
+    ui.resetConfirmClosing = false;
+    renderOverlaysOnly();
+  }, OVERLAY_FADE_MS);
+}
+
 function renderStopPrompt() {
-  if (!ui.stopPromptVisible) return "";
+  if (!ui.stopPromptVisible && !ui.stopPromptClosing) return "";
   return `
-    <div class="stop-prompt" role="status" aria-live="polite">
+    <div class="stop-prompt ${ui.stopPromptClosing ? "is-closing" : ""}" role="status" aria-live="polite">
       ${iconSvg("play")}
       <span>Press play to resume SpellTracker.</span>
     </div>
@@ -612,9 +711,9 @@ function renderStopPrompt() {
 }
 
 function renderResetConfirm() {
-  if (!ui.resetConfirmVisible) return "";
+  if (!ui.resetConfirmVisible && !ui.resetConfirmClosing) return "";
   return `
-    <div class="reset-confirm-backdrop" data-action="close-reset-confirm">
+    <div class="reset-confirm-backdrop ${ui.resetConfirmClosing ? "is-closing" : ""}" data-action="close-reset-confirm">
       <section class="reset-confirm-dialog" data-reset-panel role="dialog" aria-modal="true" aria-labelledby="reset-confirm-title">
         <button class="icon-button reset-confirm-close" type="button" data-action="cancel-reset-site" aria-label="Cancel reset">x</button>
         <div class="reset-confirm-icon">${iconSvg("reset")}</div>
@@ -624,9 +723,40 @@ function renderResetConfirm() {
         </div>
         <div class="reset-confirm-actions">
           <button class="control-button reset-confirm-cancel" type="button" data-action="cancel-reset-site">Cancel</button>
-          <button class="control-button reset-confirm-accept" type="button" data-action="confirm-reset-site">
-            ${iconSvg("reset")} Reset
-          </button>
+          <button class="control-button reset-confirm-accept" type="button" data-action="confirm-reset-site">Reset</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderHelpDialog() {
+  if (!ui.helpVisible && !ui.helpClosing) return "";
+  return `
+    <div class="help-backdrop ${ui.helpClosing ? "is-closing" : ""}" data-action="close-help">
+      <section class="help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title" data-help-panel>
+        <button class="icon-button help-close" type="button" data-action="close-help" aria-label="Close help">x</button>
+        <h2 id="help-title">SpellTracker Controls</h2>
+        <div class="help-grid">
+          <section>
+            <h3>Scoreboard</h3>
+            <p>Tap a summoner spell icon as soon as it is used. The icon starts its accurate cooldown and shows the remaining time.</p>
+            <p>Use <kbd>...</kbd> beside a spell to replace it, reset it, adjust by <kbd>1</kbd>, <kbd>5</kbd>, or <kbd>15</kbd> seconds, and toggle summoner spell haste modifiers.</p>
+          </section>
+          <section>
+            <h3>Time Control</h3>
+            <p>Open the clock button, or hold <kbd>Ctrl</kbd>, then scroll over game time or a cooldown value. Small scrolls adjust precisely; larger scrolls move faster.</p>
+            <p>With the clock active, click game time and type <kbd>12:34</kbd> or <kbd>1234</kbd>. Press <kbd>Enter</kbd> to apply or <kbd>Esc</kbd> to cancel.</p>
+          </section>
+          <section>
+            <h3>Timeline</h3>
+            <p>Timeline view shows active cooldowns as time-scaled bars. The white line is current game time and upcoming chips show the next spells becoming ready.</p>
+            <p><strong>Start game time first.</strong> Timeline accuracy depends on the game timer being enabled and aligned with the match clock.</p>
+          </section>
+          <section>
+            <h3>Global Controls</h3>
+            <p>The view slider swaps Scoreboard and Timeline. <kbd>SR</kbd>/<kbd>ARAM</kbd> changes mode, the Flash button swaps <kbd>D</kbd>/<kbd>F</kbd>, and the red square freezes tracking until play resumes.</p>
+          </section>
         </div>
       </section>
     </div>
@@ -638,9 +768,10 @@ function showStopPrompt() {
   clearTimeout(ui.stopShakeTimer);
   const wasVisible = ui.stopPromptVisible;
   ui.stopPromptVisible = true;
+  ui.stopPromptClosing = false;
   ui.interactionDenied = true;
   if (!wasVisible) {
-    render();
+    renderOverlaysOnly();
   }
 
   const shell = app.querySelector(".tracker-shell");
@@ -654,11 +785,25 @@ function showStopPrompt() {
     ui.interactionDenied = false;
     app.querySelector(".tracker-shell")?.classList.remove("is-denied");
   }, 360);
+  ui.stopPromptTimer = setTimeout(closeStopPrompt, STOP_PROMPT_MS);
+}
+
+function closeStopPrompt({ immediate = false } = {}) {
+  clearTimeout(ui.stopPromptTimer);
+  if (!ui.stopPromptVisible && !ui.stopPromptClosing) return;
+  ui.stopPromptVisible = false;
+  ui.interactionDenied = false;
+  if (immediate) {
+    ui.stopPromptClosing = false;
+    renderOverlaysOnly();
+    return;
+  }
+  ui.stopPromptClosing = true;
+  renderOverlaysOnly();
   ui.stopPromptTimer = setTimeout(() => {
-    ui.stopPromptVisible = false;
-    ui.interactionDenied = false;
-    render();
-  }, STOP_PROMPT_MS);
+    ui.stopPromptClosing = false;
+    renderOverlaysOnly();
+  }, OVERLAY_FADE_MS);
 }
 
 function isActionBlockedWhileStopped(action) {
@@ -668,6 +813,8 @@ function isActionBlockedWhileStopped(action) {
     "toggle-view",
     "toggle-flash-key",
     "toggle-theme",
+    "toggle-help",
+    "close-help",
     "reset-site",
     "confirm-reset-site",
     "dismiss-ad",
@@ -730,8 +877,8 @@ function renderUpcomingCooldowns() {
         <img class="upcoming-spell" src="${entry.spell.image}" alt="">
       </span>
       <span class="upcoming-times">
-        <b>${escapeHtml(formatSeconds(entry.remainingMs / 1000, "ceil"))}</b>
-        <em>${escapeHtml(formatGameTime(entry.endGameMs))}</em>
+        <span><small>CD</small><b>${escapeHtml(formatSeconds(entry.remainingMs / 1000, "ceil"))}</b></span>
+        <span><small>RDY</small><em>${escapeHtml(formatGameTime(entry.endGameMs))}</em></span>
       </span>
     </span>
   `).join("");
@@ -857,13 +1004,6 @@ function renderPlayer(player, playerIndex) {
         <strong>${escapeHtml(championName)}</strong>
       </section>
 
-      <section class="timers-section" aria-label="${escapeHtml(lane.label)} timers">
-        <div class="section-label">Timers</div>
-        <div class="time-controls" aria-label="${escapeHtml(lane.label)} cooldown controls">
-          ${player.slots.map((slot, slotIndex) => renderTimeControls(playerIndex, slot, slotIndex)).join("")}
-        </div>
-      </section>
-
       <div class="modifier-strip">
         <div class="haste-total" aria-label="${haste} summoner spell haste">
           ${renderHasteValue(haste)}
@@ -896,25 +1036,6 @@ function renderSpellSlot(player, playerIndex, slot, slotIndex) {
         <button class="spell-reset" type="button" data-action="clear-slot" data-player="${playerIndex}" data-slot="${slotIndex}" aria-label="Reset ${escapeHtml(spell.name)} cooldown">&#8635;</button>
       </div>
     </section>
-  `;
-}
-
-function renderTimeControls(playerIndex, slot, slotIndex) {
-  const spell = spellById(slot.spellId) || spellPool()[0];
-  const fallback = spell.name.slice(0, 2).toUpperCase();
-  return `
-    <div class="time-control-row" aria-label="${escapeHtml(spell.name)} time controls">
-      <span class="timer-spell-chip" aria-hidden="true">
-        ${spell.image ? `<img src="${spell.image}" alt="">` : `<span>${escapeHtml(fallback)}</span>`}
-      </span>
-      <div class="timer-buttons">
-        ${ADJUSTMENTS.map((amount) => `
-          <button type="button" data-action="adjust-cooldown" data-player="${playerIndex}" data-slot="${slotIndex}" data-delta="${amount}" aria-label="${amount > 0 ? "Add" : "Subtract"} ${Math.abs(amount)} seconds ${escapeHtml(spell.name)}">
-            ${amount > 0 ? "+" : ""}${amount}
-          </button>
-        `).join("")}
-      </div>
-    </div>
   `;
 }
 
@@ -975,7 +1096,8 @@ function iconSvg(name) {
     moon: `<path d="M17.5 14.8A7 7 0 0 1 9.2 6.5 7.2 7.2 0 1 0 17.5 14.8z"></path>`,
     sun: `<circle cx="12" cy="12" r="4"></circle><path d="M12 2.5v2"></path><path d="M12 19.5v2"></path><path d="m4.9 4.9 1.4 1.4"></path><path d="m17.7 17.7 1.4 1.4"></path><path d="M2.5 12h2"></path><path d="M19.5 12h2"></path><path d="m4.9 19.1 1.4-1.4"></path><path d="m17.7 6.3 1.4-1.4"></path>`,
     scoreboard: `<rect x="5" y="5" width="3.2" height="14" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="10.4" y="5" width="3.2" height="14" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="15.8" y="5" width="3.2" height="14" rx="0.7" fill="currentColor" stroke="none"></rect>`,
-    timeline: `<rect x="5" y="5" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="5" y="10.4" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="5" y="15.8" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect>`
+    timeline: `<rect x="5" y="5" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="5" y="10.4" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect><rect x="5" y="15.8" width="14" height="3.2" rx="0.7" fill="currentColor" stroke="none"></rect>`,
+    info: `<circle cx="12" cy="12" r="8"></circle><path d="M12 10.5v5"></path><path d="M12 7.6h.01"></path>`
   };
   return `
     <svg class="ui-icon ui-icon-${name}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
@@ -985,19 +1107,19 @@ function iconSvg(name) {
 }
 
 function renderChampionModal() {
-  if (ui.championPickerIndex === null) {
+  if (ui.championPickerIndex === null && !ui.championPickerClosing) {
     return "";
   }
 
   return `
-    <div class="modal-backdrop" data-action="close-champion-picker">
-      <section class="champion-modal" role="dialog" aria-modal="true" aria-label="Select champion" data-modal-panel>
+    <div class="modal-backdrop ${ui.championPickerClosing ? "is-closing" : ""}" data-action="close-champion-picker">
+      <section class="champion-modal ${ui.championPickerClosing ? "is-closing" : ""}" role="dialog" aria-modal="true" aria-label="Select champion" data-modal-panel>
         <div class="modal-head">
           <h2>Select Champion</h2>
           <button type="button" class="icon-button" data-action="close-champion-picker" aria-label="Close">X</button>
         </div>
         <input class="champion-search" type="search" placeholder="Search champion" value="${escapeHtml(ui.championQuery)}" data-action="champion-search" autocomplete="off">
-        <div class="champion-grid" data-champion-grid>
+        <div class="champion-grid ${ui.championGridRefreshing ? "is-refreshing" : ""}" data-champion-grid>
           ${championGridHtml(ui.championQuery)}
         </div>
       </section>
@@ -1007,7 +1129,7 @@ function renderChampionModal() {
 
 function renderSpellContext() {
   const context = ui.spellContext;
-  if (!context) {
+  if (!context && !ui.spellContextClosing) {
     return "";
   }
 
@@ -1018,16 +1140,17 @@ function renderSpellContext() {
   if (!player || !slot || !spell) {
     return "";
   }
+  const status = getSlotStatus(player, slot);
 
   return `
-    <div class="context-backdrop" data-action="close-spell-context">
-      <section class="spell-context" role="dialog" aria-modal="true" aria-label="${escapeHtml(spell.name)} spell menu" data-context-panel>
+    <div class="context-backdrop ${ui.spellContextClosing ? "is-closing" : ""}" data-action="close-spell-context">
+      <section class="spell-context ${ui.spellContextClosing ? "is-closing" : ""}" role="dialog" aria-modal="true" aria-label="${escapeHtml(spell.name)} spell menu" data-context-panel>
         <div class="context-head">
           <div class="context-title">
             ${spell.image ? `<img src="${spell.image}" alt="">` : ""}
             <div>
               <h2>${escapeHtml(spell.name)}</h2>
-              <span>${escapeHtml(displayRole.label)} Slot ${context.slotIndex + 1}</span>
+              <span>${escapeHtml(displayRole.label)} Slot ${context.slotIndex + 1}${status.isCooling ? ` <b class="context-cooldown-pill" data-context-timer>${escapeHtml(status.timerText)}</b>` : ""}</span>
             </div>
           </div>
           <button type="button" class="icon-button" data-action="close-spell-context" aria-label="Close">X</button>
@@ -1143,11 +1266,15 @@ function championPreferredRoles(champion) {
 function refreshChampionGrid() {
   const grid = app.querySelector("[data-champion-grid]");
   if (!grid) return;
+  grid.classList.add("is-refreshing");
   const champions = getChampionSearchResults(ui.championQuery);
   ui.championActiveIndex = champions.length
     ? clamp(ui.championActiveIndex, 0, champions.length - 1)
     : 0;
-  grid.innerHTML = championGridHtml(ui.championQuery);
+  requestAnimationFrame(() => {
+    grid.innerHTML = championGridHtml(ui.championQuery);
+    grid.classList.remove("is-refreshing");
+  });
   requestAnimationFrame(() => {
     app.querySelector(".champion-option.is-active")?.scrollIntoView({ block: "nearest" });
   });
@@ -1160,7 +1287,96 @@ function focusChampionSearch() {
   }
 }
 
+function focusGameTimeInput() {
+  const input = app.querySelector(".game-time-input");
+  if (input) {
+    requestAnimationFrame(() => {
+      input.focus();
+      input.select();
+    });
+  }
+}
+
+function startGameTimeEdit() {
+  const text = formatGameTime(currentGameTimeMs());
+  ui.gameTimeEditing = true;
+  ui.gameTimeDraft = text;
+  ui.gameTimeEditInitialText = text;
+  render();
+}
+
+function commitGameTimeEdit({ renderAfter = true } = {}) {
+  if (!ui.gameTimeEditing) return;
+  const draft = ui.gameTimeDraft;
+  const unchanged = normalizeGameTimeDraft(draft) === normalizeGameTimeDraft(ui.gameTimeEditInitialText);
+  const parsedMs = parseGameTimeInput(ui.gameTimeDraft);
+  ui.gameTimeEditing = false;
+  ui.gameTimeDraft = "";
+  ui.gameTimeEditInitialText = "";
+  if (unchanged) {
+    if (renderAfter) render();
+    return;
+  }
+  if (parsedMs === null) {
+    if (renderAfter) render();
+    return;
+  }
+  const currentTime = currentGameTimeMs();
+  const nextTime = Math.max(0, Math.min(parsedMs, MAX_GAME_TIME_MS));
+  shiftAllCooldownGameTimes(nextTime - currentTime);
+  state.gameTimeMs = nextTime;
+  state.gameStartedAt = state.gameTimerRunning && !state.paused ? Date.now() : null;
+  saveState();
+  if (renderAfter) render();
+}
+
+function cancelGameTimeEdit() {
+  ui.gameTimeEditing = false;
+  ui.gameTimeDraft = "";
+  ui.gameTimeEditInitialText = "";
+  render();
+}
+
+function parseGameTimeInput(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const normalized = text.replace(/[^\d:]/g, "");
+  if (!normalized) return null;
+  if (!normalized.includes(":")) {
+    const digits = normalized.replace(/\D/g, "");
+    if (digits.length <= 2) {
+      return Math.max(0, Math.floor(Number(digits) || 0)) * 1000;
+    }
+    const seconds = Math.min(59, Math.floor(Number(digits.slice(-2)) || 0));
+    const minutes = Math.floor(Number(digits.slice(0, -2)) || 0);
+    return Math.max(0, (minutes * 60 + seconds) * 1000);
+  }
+  const parts = normalized.split(":").filter((part) => part !== "").map((part) => Math.floor(Number(part) || 0));
+  if (!parts.length) return null;
+  const seconds = parts.pop() || 0;
+  const minutes = parts.pop() || 0;
+  const hours = parts.pop() || 0;
+  return Math.max(0, ((hours * 60 + minutes) * 60 + Math.min(seconds, 59)) * 1000);
+}
+
+function normalizeGameTimeDraft(value) {
+  return String(value || "").replace(/[^\d:]/g, "").replace(/^0+(?=\d)/, "");
+}
+
+function syncClockHeldClass() {
+  document.documentElement.classList.toggle("is-ctrl-clock", ui.ctrlClockHeld);
+  app.querySelector(".game-clock-button")?.classList.toggle("is-on", isClockControlActive());
+}
+
 function handleClick(event) {
+  if (isClockControlActive(event) && event.target.closest("[data-game-time-readout]") && !event.target.closest(".game-time-input")) {
+    if (state.paused) {
+      showStopPrompt();
+      return;
+    }
+    startGameTimeEdit();
+    return;
+  }
   const actionTarget = event.target.closest("[data-action]");
   if (ui.gameTimerMenuOpen && !event.target.closest(".game-timer")) {
     closeGameTimeMenu();
@@ -1189,6 +1405,9 @@ function handleClick(event) {
   if (action === "close-reset-confirm" && event.target.closest("[data-reset-panel]") && actionTarget.classList.contains("reset-confirm-backdrop")) {
     return;
   }
+  if (action === "close-help" && event.target.closest("[data-help-panel]") && actionTarget.classList.contains("help-backdrop")) {
+    return;
+  }
 
   if (state.paused && isActionBlockedWhileStopped(action)) {
     showStopPrompt();
@@ -1208,7 +1427,7 @@ function handleClick(event) {
 
   if (action === "toggle-view") {
     state.viewMode = state.viewMode === "timeline" ? "scoreboard" : "timeline";
-    ui.spellContext = null;
+    closeSpellContext({ immediate: true, renderAfter: false });
     ui.viewTransition = true;
     closeGameTimeMenu({ immediate: true, renderAfter: false });
     saveAndRender();
@@ -1244,18 +1463,36 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "toggle-help") {
+    if (ui.helpVisible) {
+      closeHelp();
+      return;
+    }
+    openHelp();
+    closeSpellContext({ immediate: true, renderAfter: false });
+    closeChampionPicker({ immediate: true, renderAfter: false });
+    closeGameTimeMenu({ immediate: true, renderAfter: false });
+    renderOverlaysOnly();
+    return;
+  }
+
+  if (action === "close-help") {
+    closeHelp();
+    return;
+  }
+
   if (action === "reset-site") {
     ui.resetConfirmVisible = true;
-    ui.spellContext = null;
-    ui.championPickerIndex = null;
+    ui.resetConfirmClosing = false;
+    closeSpellContext({ immediate: true, renderAfter: false });
+    closeChampionPicker({ immediate: true, renderAfter: false });
     closeGameTimeMenu({ immediate: true, renderAfter: false });
-    render();
+    renderOverlaysOnly();
     return;
   }
 
   if (action === "cancel-reset-site" || action === "close-reset-confirm") {
-    ui.resetConfirmVisible = false;
-    render();
+    closeResetConfirm();
     return;
   }
 
@@ -1276,10 +1513,12 @@ function handleClick(event) {
   }
 
   if (action === "open-champion-picker") {
+    clearTimeout(ui.championPickerCloseTimer);
     ui.championPickerIndex = Number(actionTarget.dataset.player);
+    ui.championPickerClosing = false;
     ui.championQuery = "";
     ui.championActiveIndex = 0;
-    ui.spellContext = null;
+    closeSpellContext({ immediate: true, renderAfter: false });
     render();
     return;
   }
@@ -1299,19 +1538,24 @@ function handleClick(event) {
   }
 
   if (action === "toggle-spell-context") {
+    clearTimeout(ui.spellContextCloseTimer);
     const next = {
       playerIndex: Number(actionTarget.dataset.player),
       slotIndex: Number(actionTarget.dataset.slot)
     };
     const current = ui.spellContext;
-    ui.spellContext = current?.playerIndex === next.playerIndex && current?.slotIndex === next.slotIndex ? null : next;
+    if (current?.playerIndex === next.playerIndex && current?.slotIndex === next.slotIndex && !ui.spellContextClosing) {
+      closeSpellContext();
+      return;
+    }
+    ui.spellContextClosing = false;
+    ui.spellContext = next;
     render();
     return;
   }
 
   if (action === "close-spell-context") {
-    ui.spellContext = null;
-    render();
+    closeSpellContext();
     return;
   }
 
@@ -1349,7 +1593,7 @@ function handleClick(event) {
 
   if (action === "replace-spell") {
     replaceSpell(Number(actionTarget.dataset.player), Number(actionTarget.dataset.slot), actionTarget.dataset.spellId);
-    ui.spellContext = null;
+    closeSpellContext({ immediate: true, renderAfter: false });
     saveAndRender();
   }
 }
@@ -1358,7 +1602,7 @@ function handleChange() {}
 
 function handleWheel(event) {
   const gameReadout = event.target.closest(".game-time-readout");
-  if (ui.gameTimerMenuOpen && gameReadout) {
+  if (isClockControlActive(event) && gameReadout) {
     event.preventDefault();
     if (state.paused) {
       showStopPrompt();
@@ -1369,7 +1613,7 @@ function handleWheel(event) {
   }
 
   const cooldownTarget = event.target.closest("[data-spell-timer], .timeline-block em");
-  if (!ui.gameTimerMenuOpen) return;
+  if (!isClockControlActive(event)) return;
   if (!cooldownTarget) return;
   const source = cooldownTarget.closest(".spell-panel[data-player][data-slot], .timeline-spell[data-player][data-slot], .timeline-block[data-player][data-slot]");
   if (!source) return;
@@ -1386,12 +1630,16 @@ function handleWheel(event) {
 function wheelSecondsFromDelta(deltaY) {
   const direction = deltaY < 0 ? 1 : -1;
   const distance = Math.abs(Number(deltaY) || 0);
-  const magnitude = clamp(Math.round(Math.max(1, Math.pow(distance / 42, 1.2))), 1, 30);
+  const magnitude = clamp(Math.floor(Math.max(1, Math.pow(distance / 90, 1.42))), 1, 45);
   return direction * magnitude;
 }
 
 function handleInput(event) {
   const target = event.target;
+  if (target.dataset.action === "game-time-input") {
+    ui.gameTimeDraft = target.value;
+    return;
+  }
   if (target.dataset.action !== "champion-search") return;
   ui.championQuery = target.value;
   ui.championActiveIndex = 0;
@@ -1399,10 +1647,29 @@ function handleInput(event) {
 }
 
 function handleKeydown(event) {
+  if (event.key === "Control" && !ui.ctrlClockHeld) {
+    ui.ctrlClockHeld = true;
+    syncClockHeldClass();
+  }
+
+  if (ui.gameTimeEditing) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitGameTimeEdit();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelGameTimeEdit();
+      return;
+    }
+  }
+
   if (event.key === "Escape") {
-    if (ui.spellContext) {
-      ui.spellContext = null;
-      render();
+    if (ui.helpVisible) {
+      closeHelp();
+    } else if (ui.spellContext) {
+      closeSpellContext();
     } else if (ui.championPickerIndex !== null) {
       closeChampionPicker();
     }
@@ -1429,15 +1696,64 @@ function handleKeydown(event) {
   }
 }
 
-function closeChampionPicker(alreadySaved = false) {
-  ui.championPickerIndex = null;
-  ui.championQuery = "";
-  ui.championActiveIndex = 0;
-  if (alreadySaved) {
-    saveAndRender();
-  } else {
-    render();
+function handleKeyup(event) {
+  if (event.key !== "Control") return;
+  ui.ctrlClockHeld = false;
+  syncClockHeldClass();
+}
+
+function handleFocusOut(event) {
+  if (event.target?.dataset?.action === "game-time-input") {
+    setTimeout(() => commitGameTimeEdit(), 0);
   }
+}
+
+function closeChampionPicker(options = {}) {
+  const config = typeof options === "boolean" ? { alreadySaved: options } : options;
+  const { alreadySaved = false, immediate = false, renderAfter = true } = config;
+  clearTimeout(ui.championPickerCloseTimer);
+  if (ui.championPickerIndex === null && !ui.championPickerClosing) return;
+
+  const finish = () => {
+    ui.championPickerIndex = null;
+    ui.championQuery = "";
+    ui.championActiveIndex = 0;
+    ui.championPickerClosing = false;
+    if (alreadySaved) {
+      saveAndRender();
+    } else if (renderAfter) {
+      render();
+    }
+  };
+
+  if (immediate) {
+    finish();
+    return;
+  }
+
+  ui.championPickerClosing = true;
+  if (renderAfter) render();
+  ui.championPickerCloseTimer = setTimeout(finish, OVERLAY_FADE_MS);
+}
+
+function closeSpellContext({ immediate = false, renderAfter = true } = {}) {
+  clearTimeout(ui.spellContextCloseTimer);
+  if (!ui.spellContext && !ui.spellContextClosing) return;
+
+  const finish = () => {
+    ui.spellContext = null;
+    ui.spellContextClosing = false;
+    if (renderAfter) render();
+  };
+
+  if (immediate) {
+    finish();
+    return;
+  }
+
+  ui.spellContextClosing = true;
+  if (renderAfter) render();
+  ui.spellContextCloseTimer = setTimeout(finish, OVERLAY_FADE_MS);
 }
 
 function pickActiveChampion() {
@@ -1457,7 +1773,7 @@ function cycleChampionSelection(step) {
 
 function setMode(mode) {
   state.mode = mode;
-  ui.spellContext = null;
+  closeSpellContext({ immediate: true, renderAfter: false });
   for (let playerIndex = 0; playerIndex < state.players.length; playerIndex += 1) {
     const player = state.players[playerIndex];
     player.role = mode === "aram" ? "mid" : LANES[playerIndex].id;
@@ -1473,12 +1789,31 @@ function setMode(mode) {
 }
 
 function resetSite() {
+  const counterTotal = parseCounterValue(state?.counterTotal).toString();
+  const counterPending = Math.max(0, Number(state?.counterPending) || 0);
+  const counterLastFetchAt = Math.max(0, Number(state?.counterLastFetchAt) || 0);
+  const theme = state?.theme === "light" ? "light" : "dark";
+  const flashKey = state?.flashKey === "F" ? "F" : "D";
   state = makeDefaultState();
+  state.theme = theme;
+  state.flashKey = flashKey;
+  state.counterTotal = counterTotal;
+  state.counterPending = counterPending;
+  state.counterLastFetchAt = counterLastFetchAt;
+  for (const player of state.players) {
+    applyFlashPreferenceToPlayer(player, flashKey);
+  }
   ui.championPickerIndex = null;
   ui.championQuery = "";
   ui.championActiveIndex = 0;
   ui.spellContext = null;
   ui.resetConfirmVisible = false;
+  ui.resetConfirmClosing = false;
+  ui.helpVisible = false;
+  ui.helpClosing = false;
+  ui.gameTimeEditing = false;
+  ui.gameTimeDraft = "";
+  ui.gameTimeEditInitialText = "";
   closeGameTimeMenu({ immediate: true, renderAfter: false });
   saveAndRender();
 }
@@ -1540,6 +1875,8 @@ function adjustGameTime(seconds) {
     showStopPrompt();
     return;
   }
+  ui.gameTimeEditing = false;
+  ui.gameTimeDraft = "";
   const currentTime = currentGameTimeMs();
   const nextTime = Math.max(0, currentTime + seconds * 1000);
   shiftAllCooldownGameTimes(nextTime - currentTime);
@@ -1653,6 +1990,7 @@ function startFullCooldown(playerIndex, slotIndex) {
 function adjustCooldown(playerIndex, slotIndex, seconds) {
   const player = state.players[playerIndex];
   const slot = player.slots[slotIndex];
+  const spell = spellById(slot.spellId);
   const now = referenceNow();
   const active = activeCooldowns(slot, now);
 
@@ -1665,7 +2003,7 @@ function adjustCooldown(playerIndex, slotIndex, seconds) {
 
   const adjusted = adjustCooldownEntry(active[0], seconds * 1000, now);
   if (cooldownEndAt(adjusted) <= now) {
-    if (isCountableCooldown(adjusted)) {
+    if (isCountableCooldown(adjusted, spell, player, now)) {
       addPendingCooldownCompletions(1);
     }
     active.shift();
@@ -1703,7 +2041,8 @@ function normalizeCooldownEntry(entry) {
       endAt: Number(entry),
       startGameMs: null,
       endGameMs: null,
-      durationMs: null
+      durationMs: null,
+      originalDurationMs: null
     };
   }
 
@@ -1721,7 +2060,12 @@ function normalizeCooldownEntry(entry) {
     endAt,
     startGameMs: Number.isFinite(Number(entry.startGameMs)) ? Number(entry.startGameMs) : null,
     endGameMs: Number.isFinite(Number(entry.endGameMs)) ? Number(entry.endGameMs) : null,
-    durationMs: Number.isFinite(Number(entry.durationMs)) ? Math.max(0, Number(entry.durationMs)) : null
+    durationMs: Number.isFinite(Number(entry.durationMs)) ? Math.max(0, Number(entry.durationMs)) : null,
+    originalDurationMs: Number.isFinite(Number(entry.originalDurationMs))
+      ? Math.max(0, Number(entry.originalDurationMs))
+      : Number.isFinite(Number(entry.durationMs))
+        ? Math.max(0, Number(entry.durationMs))
+        : null
   };
 }
 
@@ -1733,7 +2077,8 @@ function createCooldown(now, durationMs) {
     endAt: now + safeDuration,
     startGameMs: gameNow,
     endGameMs: gameNow + safeDuration,
-    durationMs: safeDuration
+    durationMs: safeDuration,
+    originalDurationMs: safeDuration
   };
 }
 
@@ -1773,7 +2118,8 @@ function adjustCooldownEntry(cooldown, deltaMs, now) {
     endAt: nextEndAt,
     startGameMs,
     endGameMs: nextEndGameMs,
-    durationMs: Math.max(0, nextEndAt - startAt)
+    durationMs: Math.max(Number(entry.durationMs) || 0, Math.max(0, nextEndAt - startAt)),
+    originalDurationMs: Math.max(Number(entry.originalDurationMs) || 0, Number(entry.durationMs) || 0, Math.max(0, nextEndAt - startAt))
   };
 }
 
@@ -1863,6 +2209,14 @@ function updateTimers() {
     const charges = panel.querySelector("[data-charge-count]");
     if (timer) timer.textContent = status.timerText;
     if (charges) charges.textContent = status.chargeText;
+  }
+
+  const contextTimer = app.querySelector("[data-context-timer]");
+  if (contextTimer && ui.spellContext) {
+    const player = state.players[ui.spellContext.playerIndex];
+    const slot = player?.slots[ui.spellContext.slotIndex];
+    const status = player && slot ? getSlotStatus(player, slot) : null;
+    contextTimer.textContent = status?.isCooling ? status.timerText : "";
   }
 
   const timeline = app.querySelector("[data-timeline-view]");
@@ -2014,6 +2368,7 @@ function pruneAllCooldowns() {
   let changed = false;
   for (const player of state.players) {
     for (const slot of player.slots) {
+      const spell = spellById(slot.spellId);
       const nextCooldowns = [];
       for (const cooldown of slot.cooldowns.map(normalizeCooldownEntry)) {
         if (!cooldown) {
@@ -2023,7 +2378,7 @@ function pruneAllCooldowns() {
         if (cooldownEndAt(cooldown) > now) {
           nextCooldowns.push(cooldown);
         } else {
-          completedCount += isCountableCooldown(cooldown) ? 1 : 0;
+          completedCount += isCountableCooldown(cooldown, spell, player, now) ? 1 : 0;
           changed = true;
         }
       }
@@ -2037,9 +2392,16 @@ function pruneAllCooldowns() {
   }
 }
 
-function isCountableCooldown(cooldown) {
+function isCountableCooldown(cooldown, spell, player, now = referenceNow()) {
   const entry = normalizeCooldownEntry(cooldown);
-  return Boolean(entry && Number(entry.durationMs) > 0);
+  if (!entry || !spell || !player) return false;
+  const startAt = Number(entry.startAt);
+  if (!Number.isFinite(startAt)) return false;
+  const requiredMs = Math.max(1, effectiveCooldown(spell, player) * 1000);
+  const trackedMs = Math.max(0, Math.min(now, cooldownEndAt(entry)) - startAt);
+  const originalMs = Math.max(0, Number(entry.originalDurationMs) || Number(entry.durationMs) || 0);
+  return trackedMs >= requiredMs * MIN_TRACKED_COOLDOWN_RATIO
+    && originalMs >= requiredMs * MIN_TRACKED_COOLDOWN_RATIO;
 }
 
 function saveAndRender() {
@@ -2234,7 +2596,23 @@ function formatCounterNumber(value) {
 }
 
 function formatCompactNumber(value) {
-  return Math.max(0, Math.floor(Number(value) || 0)).toLocaleString("en-US");
+  return parseCounterValue(value).toLocaleString("en-US");
+}
+
+function parseCounterValue(value) {
+  try {
+    if (typeof value === "bigint") return value < 0n ? 0n : value;
+    const text = String(value ?? "0").replace(/[^\d]/g, "");
+    return text ? BigInt(text) : 0n;
+  } catch {
+    return 0n;
+  }
+}
+
+function maxCounterString(left, right) {
+  const leftValue = parseCounterValue(left);
+  const rightValue = parseCounterValue(right);
+  return (rightValue > leftValue ? rightValue : leftValue).toString();
 }
 
 function clamp(value, min, max) {

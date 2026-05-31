@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 
 const COUNTER_OBJECT_NAME = "global-cooldowns-tracked";
-const MAX_INCREMENT = 100;
+const MAX_INCREMENT = 20;
+const COOLDOWN_INCREMENT_LIMIT_PER_MINUTE = 60;
+const ANALYTICS_EVENT_LIMIT_PER_MINUTE = 120;
 const ANALYTICS_EVENTS = new Set(["site-view", "ad-click"]);
 const ALLOWED_ORIGINS = new Set([
   "https://spelltracker.lol",
@@ -29,6 +31,10 @@ export class CooldownCounter extends DurableObject {
       if (!amount) {
         return jsonResponse({ error: "Expected a positive integer amount." }, { status: 400 });
       }
+      const allowed = await this.takeRateLimitSlot("cooldown", clientKey(request), COOLDOWN_INCREMENT_LIMIT_PER_MINUTE, amount);
+      if (!allowed) {
+        return jsonResponse({ error: "Rate limited." }, { status: 429 });
+      }
       const total = await this.increment(amount);
       return jsonResponse({ total, accepted: amount, updatedAt: new Date().toISOString() });
     }
@@ -38,6 +44,10 @@ export class CooldownCounter extends DurableObject {
       const event = String(body?.event || "");
       if (!ANALYTICS_EVENTS.has(event)) {
         return jsonResponse({ error: "Unknown analytics event." }, { status: 400 });
+      }
+      const allowed = await this.takeRateLimitSlot("analytics", clientKey(request), ANALYTICS_EVENT_LIMIT_PER_MINUTE, 1);
+      if (!allowed) {
+        return jsonResponse({ error: "Rate limited." }, { status: 429 });
       }
       const stats = await this.trackAnalytics(event, {
         adId: normalizeAnalyticsKey(body?.adId),
@@ -50,13 +60,17 @@ export class CooldownCounter extends DurableObject {
   }
 
   async total() {
-    return Math.max(0, Number(await this.ctx.storage.get("total")) || 0);
+    return this.totalBigInt().then((total) => total.toString());
+  }
+
+  async totalBigInt() {
+    return parseStoredBigInt(await this.ctx.storage.get("total"));
   }
 
   async increment(amount) {
-    const total = (await this.total()) + amount;
-    await this.ctx.storage.put("total", total);
-    return total;
+    const total = (await this.totalBigInt()) + BigInt(amount);
+    await this.ctx.storage.put("total", total.toString());
+    return total.toString();
   }
 
   async analytics() {
@@ -97,6 +111,18 @@ export class CooldownCounter extends DurableObject {
     await this.ctx.storage.put(key, map);
     return map;
   }
+
+  async takeRateLimitSlot(bucket, keyName, limit, cost) {
+    const minute = Math.floor(Date.now() / 60000);
+    const key = `rate:${bucket}:${minute}`;
+    const counts = (await this.ctx.storage.get(key)) || {};
+    const used = Math.max(0, Number(counts[keyName]) || 0);
+    if (used + cost > limit) return false;
+    counts[keyName] = used + cost;
+    await this.ctx.storage.put(key, counts);
+    await this.ctx.storage.delete(`rate:${bucket}:${minute - 3}`);
+    return true;
+  }
 }
 
 export default {
@@ -129,11 +155,29 @@ function parseIncrementAmount(value) {
   return Math.min(MAX_INCREMENT, integer);
 }
 
+function parseStoredBigInt(value) {
+  try {
+    const text = String(value ?? "0").replace(/[^\d]/g, "");
+    return text ? BigInt(text) : 0n;
+  } catch {
+    return 0n;
+  }
+}
+
 function normalizeAnalyticsKey(value) {
   return String(value || "unknown")
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "")
     .slice(0, 64) || "unknown";
+}
+
+function clientKey(request) {
+  return normalizeAnalyticsKey(
+    request.headers.get("CF-Connecting-IP")
+    || request.headers.get("X-Forwarded-For")
+    || request.headers.get("Origin")
+    || "unknown"
+  );
 }
 
 function rate(numerator, denominator) {
